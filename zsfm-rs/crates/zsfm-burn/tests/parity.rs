@@ -1,10 +1,11 @@
-//! Candle-vs-Burn parity + timing, offline (fixed synthetic inputs).
+//! Burn operator correctness + timing, offline (fixed synthetic inputs).
 //!
-//! Run with `-- --nocapture` to print the timing table. Every case asserts
-//! max-abs-error below 1e-5 and records median ms over 50 iterations.
+//! Run with `-- --nocapture` to print the timing table. Every case checks
+//! the Burn operator against an independent pure-Rust host reference and
+//! records median ms over 50 iterations. (The original candle-vs-Burn
+//! parity gates passed and were retired with the candle removal.)
 
 use burn::tensor::{Device, Tensor, TensorData};
-use candle_core::{Device as CDevice, Tensor as CTensor};
 use zsfm_burn::bench::{bench_op, max_abs_err};
 
 fn dev() -> Device {
@@ -24,26 +25,77 @@ fn pseudo_data(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
+/// Host reference: y = x @ w^T + b, w row-major [d_out, d_in].
+fn host_linear(x: &[f32], lead: usize, w: &[f32], d_out: usize, b: &[f32]) -> Vec<f32> {
+    let d_in = b.len();
+    assert_eq!(w.len(), d_out * d_in);
+    let mut y = vec![0.0f32; lead * d_out];
+    for i in 0..lead {
+        for o in 0..d_out {
+            let mut acc = b[o];
+            for k in 0..d_in {
+                acc += w[o * d_in + k] * x[i * d_in + k];
+            }
+            y[i * d_out + o] = acc;
+        }
+    }
+    y
+}
+
+/// Host reference: y = x / sqrt(mean(x^2) + eps) * w, per row.
+fn host_rms_norm(x: &[f32], n: usize, w: &[f32], eps: f32) -> Vec<f32> {
+    let d = w.len();
+    let mut y = vec![0.0f32; x.len()];
+    for i in 0..n {
+        let row = &x[i * d..(i + 1) * d];
+        let ms: f32 = row.iter().map(|v| v * v).sum::<f32>() / d as f32;
+        let s = 1.0 / (ms + eps).sqrt();
+        for k in 0..d {
+            y[i * d + k] = row[k] * s * w[k];
+        }
+    }
+    y
+}
+
+/// Host reference: softmax(Q K^T * scale) V, single head, no mask.
+fn host_attention(q: &[f32], k: &[f32], v: &[f32], sq: usize, sk: usize, hd: usize) -> Vec<f32> {
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut out = vec![0.0f32; sq * hd];
+    for i in 0..sq {
+        let mut scores = vec![0.0f32; sk];
+        for j in 0..sk {
+            let mut acc = 0.0f32;
+            for d in 0..hd {
+                acc += q[i * hd + d] * k[j * hd + d];
+            }
+            scores[j] = acc * scale;
+        }
+        let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for s in scores.iter_mut() {
+            *s = (*s - m).exp();
+            sum += *s;
+        }
+        for d in 0..hd {
+            let mut acc = 0.0f32;
+            for j in 0..sk {
+                acc += scores[j] / sum * v[j * hd + d];
+            }
+            out[i * hd + d] = acc;
+        }
+    }
+    out
+}
+
 #[test]
-fn linear_parity_and_timing() {
+fn linear_correctness_and_timing() {
     let (lead, d_in, d_out) = (32, 64, 64);
     let xv = pseudo_data(lead * d_in, 1);
     let wv = pseudo_data(d_out * d_in, 2);
     let bv = pseudo_data(d_out, 3);
 
-    // Candle reference.
-    let cdev = CDevice::Cpu;
-    let x = CTensor::from_vec(xv.clone(), (lead, d_in), &cdev).unwrap();
-    let w = CTensor::from_vec(wv.clone(), (d_out, d_in), &cdev).unwrap();
-    let b = CTensor::from_vec(bv.clone(), d_out, &cdev).unwrap();
-    let expected: Vec<f32> = zsfm_nn::linear(&x, &w, Some(&b))
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .to_vec1()
-        .unwrap();
+    let expected = host_linear(&xv, lead, &wv, d_out, &bv);
 
-    // Burn.
     let device = dev();
     let bx = Tensor::<2>::from_data(TensorData::new(xv.clone(), [lead, d_in]), &device);
     let bw = Tensor::<2>::from_data(TensorData::new(wv.clone(), [d_out, d_in]), &device);
@@ -54,33 +106,20 @@ fn linear_parity_and_timing() {
         .unwrap();
 
     let err = max_abs_err(&expected, &got);
-    let candle_ms = bench_op(50, || {
-        let _ = zsfm_nn::linear(&x, &w, Some(&b)).unwrap();
-    });
     let burn_ms = bench_op(50, || {
         let _ = zsfm_burn::linear::burn_linear_bias(bx.clone(), bw.clone(), bb.clone());
     });
-    println!(
-        "linear [{lead}x{d_in}->{d_out}]: candle {candle_ms:.3}ms burn {burn_ms:.3}ms err {err:.2e}"
-    );
-    assert!(err < 1e-5, "linear parity failed: {err}");
+    println!("linear [{lead}x{d_in}->{d_out}]: burn {burn_ms:.3}ms err {err:.2e}");
+    assert!(err < 1e-5, "linear mismatch: {err}");
 }
 
 #[test]
-fn rms_norm_parity_and_timing() {
+fn rms_norm_correctness_and_timing() {
     let (n, d) = (32, 64);
     let xv = pseudo_data(n * d, 11);
     let wv = pseudo_data(d, 12);
 
-    let cdev = CDevice::Cpu;
-    let x = CTensor::from_vec(xv.clone(), (n, d), &cdev).unwrap();
-    let w = CTensor::from_vec(wv.clone(), d, &cdev).unwrap();
-    let expected: Vec<f32> = zsfm_nn::rms_norm(&x, Some(&w), 1e-6)
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .to_vec1()
-        .unwrap();
+    let expected = host_rms_norm(&xv, n, &wv, 1e-6);
 
     let device = dev();
     let bx = Tensor::<2>::from_data(TensorData::new(xv.clone(), [n, d]), &device);
@@ -91,34 +130,32 @@ fn rms_norm_parity_and_timing() {
         .unwrap();
 
     let err = max_abs_err(&expected, &got);
-    let candle_ms = bench_op(50, || {
-        let _ = zsfm_nn::rms_norm(&x, Some(&w), 1e-6).unwrap();
-    });
     let burn_ms = bench_op(50, || {
         let _ = zsfm_burn::norm::burn_rms_norm(bx.clone(), bw.clone(), 1e-6);
     });
-    println!("rms_norm [{n}x{d}]: candle {candle_ms:.3}ms burn {burn_ms:.3}ms err {err:.2e}");
-    assert!(err < 1e-4, "rms_norm parity failed: {err}");
+    println!("rms_norm [{n}x{d}]: burn {burn_ms:.3}ms err {err:.2e}");
+    assert!(err < 1e-4, "rms_norm mismatch: {err}");
 }
 
 #[test]
-fn attention_parity_and_timing() {
+fn attention_correctness_and_timing() {
     let (b, h, sq, sk, hd) = (2, 4, 16, 16, 32);
     let qv = pseudo_data(b * h * sq * hd, 21);
     let kv = pseudo_data(b * h * sk * hd, 22);
     let vv = pseudo_data(b * h * sk * hd, 23);
 
-    let cdev = CDevice::Cpu;
-    let q = CTensor::from_vec(qv.clone(), (b, h, sq, hd), &cdev).unwrap();
-    let k = CTensor::from_vec(kv.clone(), (b, h, sk, hd), &cdev).unwrap();
-    let v = CTensor::from_vec(vv.clone(), (b, h, sk, hd), &cdev).unwrap();
-    let scale = 1.0 / (hd as f64).sqrt();
-    let expected: Vec<f32> = zsfm_nn::scaled_dot_product_attention(&q, &k, &v, scale, None)
-        .unwrap()
-        .flatten_all()
-        .unwrap()
-        .to_vec1()
-        .unwrap();
+    // Host reference per (batch, head).
+    let mut expected = Vec::with_capacity(qv.len());
+    for bh in 0..b * h {
+        expected.extend_from_slice(&host_attention(
+            &qv[bh * sq * hd..(bh + 1) * sq * hd],
+            &kv[bh * sk * hd..(bh + 1) * sk * hd],
+            &vv[bh * sk * hd..(bh + 1) * sk * hd],
+            sq,
+            sk,
+            hd,
+        ));
+    }
 
     let device = dev();
     let bq = Tensor::<4>::from_data(TensorData::new(qv.clone(), [b, h, sq, hd]), &device);
@@ -136,9 +173,6 @@ fn attention_parity_and_timing() {
     .unwrap();
 
     let err = max_abs_err(&expected, &got);
-    let candle_ms = bench_op(20, || {
-        let _ = zsfm_nn::scaled_dot_product_attention(&q, &k, &v, scale, None).unwrap();
-    });
     let burn_ms = bench_op(20, || {
         let _ = zsfm_burn::attn::burn_attention(
             bq.clone(),
@@ -148,8 +182,6 @@ fn attention_parity_and_timing() {
             None,
         );
     });
-    println!(
-        "attn [b{b} h{h} sq{sq} hd{hd}]: candle {candle_ms:.3}ms burn {burn_ms:.3}ms err {err:.2e}"
-    );
-    assert!(err < 1e-4, "attention parity failed: {err}");
+    println!("attn [b{b} h{h} sq{sq} hd{hd}]: burn {burn_ms:.3}ms err {err:.2e}");
+    assert!(err < 1e-4, "attention mismatch: {err}");
 }

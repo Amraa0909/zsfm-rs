@@ -78,6 +78,7 @@ base64 = "0.22"
 half = "2"
 hdf5 = { package = "hdf5-metno", version = "0.10", features = ["static", "f16"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+pytorch-reader = "0.22"
 rayon = "1"
 simdeez = "3"
 csv = "1"

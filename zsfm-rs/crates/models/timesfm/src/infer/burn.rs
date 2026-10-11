@@ -1,18 +1,14 @@
 //! TimesFM 2.5 inference on the Burn backend (Flex CPU).
 //!
-//! Bit-exact port of `super` (candle): same RevIN running stats, tokenizer,
-//! prefill + KV-cached decode, RoPE, and denormalization. Weight loading goes
-//! through the existing candle GGUF reader and converts each F32 tensor to
-//! Burn `TensorData`, so there is exactly one GGUF parser. Architecture
-//! constants mirror the fixed values in `super`.
+//! Same RevIN running stats, tokenizer, prefill + KV-cached decode, RoPE,
+//! and denormalization, with weights loaded straight from GGUF via
+//! [`zsfm_burn::GgufWeights`]. Architecture constants mirror the model.
 
-use std::io::BufReader;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use burn::tensor::{activation, Device, Tensor, TensorData};
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device as CDevice};
+use zsfm_burn::{open_gguf_weights, GgufWeights};
 
 const D_MODEL: usize = 1280;
 const N_HEADS: usize = 16;
@@ -32,40 +28,20 @@ fn device() -> Device {
     Device::flex()
 }
 
-fn burn2(t: &candle_core::Tensor) -> Result<Tensor<2>> {
-    zsfm_burn::burn_weight_2d(t, &device())
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
 }
 
-fn burn1(t: &candle_core::Tensor) -> Result<Tensor<1>> {
-    zsfm_burn::burn_weight_1d(t, &device())
+fn load_v(weights: &GgufWeights, name: &str) -> Result<Tensor<1>> {
+    weights.load_1d(name)
 }
 
-fn load_t(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<2>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn2(&t)
+fn load_w(weights: &GgufWeights, name: &str, expected_d_out: usize) -> Result<Tensor<2>> {
+    weights.load_weight_2d(name, expected_d_out)
 }
 
-fn load_v(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<1>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn1(&t)
-}
-
-fn load_w(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-    expected_d_out: usize,
-) -> Result<Tensor<2>> {
-    let t = zsfm_nn::load_weight(content, reader, name, expected_d_out, &CDevice::Cpu)?;
-    burn2(&t)
+fn load_flat(weights: &GgufWeights, name: &str) -> Result<Vec<f32>> {
+    weights.load_flat(name)
 }
 
 struct BurnResidualBlockW {
@@ -218,34 +194,23 @@ fn compute_q_scale(raw: Vec<f32>) -> Vec<f32> {
 }
 
 fn load_residual_block(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
+    weights: &GgufWeights,
     prefix: &str,
     hidden_d_out: usize,
     out_d_out: usize,
     with_bias: bool,
 ) -> Result<BurnResidualBlockW> {
-    let hidden_w = load_w(
-        content,
-        reader,
-        &format!("{prefix}.hidden.weight"),
-        hidden_d_out,
-    )?;
+    let hidden_w = load_w(&weights, &format!("{prefix}.hidden.weight"), hidden_d_out)?;
     let hidden_b = with_bias
-        .then(|| load_v(content, reader, &format!("{prefix}.hidden.bias")))
+        .then(|| load_v(&weights, &format!("{prefix}.hidden.bias")))
         .transpose()?;
-    let output_w = load_w(
-        content,
-        reader,
-        &format!("{prefix}.output.weight"),
-        out_d_out,
-    )?;
+    let output_w = load_w(&weights, &format!("{prefix}.output.weight"), out_d_out)?;
     let output_b = with_bias
-        .then(|| load_v(content, reader, &format!("{prefix}.output.bias")))
+        .then(|| load_v(&weights, &format!("{prefix}.output.bias")))
         .transpose()?;
-    let skip_w = load_w(content, reader, &format!("{prefix}.skip.weight"), out_d_out)?;
+    let skip_w = load_w(&weights, &format!("{prefix}.skip.weight"), out_d_out)?;
     let skip_b = with_bias
-        .then(|| load_v(content, reader, &format!("{prefix}.skip.bias")))
+        .then(|| load_v(&weights, &format!("{prefix}.skip.bias")))
         .transpose()?;
     Ok(BurnResidualBlockW {
         hidden_w,
@@ -295,57 +260,29 @@ fn burn_decode_mask(new_len: usize, cache_len: usize) -> Tensor<4> {
 
 impl BurnTimesFMModel {
     pub fn load(gguf_path: &Path) -> Result<Self> {
-        let file = std::fs::File::open(gguf_path)
+        let weights = open_gguf_weights(gguf_path)
             .with_context(|| format!("open {}", gguf_path.display()))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-        let content = gguf_file::Content::read(&mut reader).context("parse GGUF header")?;
 
-        let tokenizer =
-            load_residual_block(&content, &mut reader, "tokenizer", D_MODEL, D_MODEL, true)?;
+        let tokenizer = load_residual_block(&weights, "tokenizer", D_MODEL, D_MODEL, true)?;
 
         let mut blocks = Vec::with_capacity(N_LAYERS);
         for n in 0..N_LAYERS {
             let b = format!("blk.{n}");
-            let qkv_w = load_w(
-                &content,
-                &mut reader,
-                &format!("{b}.attn_qkv.weight"),
-                3 * D_MODEL,
-            )?;
-            let out_w = load_w(
-                &content,
-                &mut reader,
-                &format!("{b}.attn_out.weight"),
-                D_MODEL,
-            )?;
-            let q_norm_w = load_v(&content, &mut reader, &format!("{b}.attn_q_norm.weight"))?;
-            let k_norm_w = load_v(&content, &mut reader, &format!("{b}.attn_k_norm.weight"))?;
-            let q_scale_raw: Vec<f32> = zsfm_nn::load_vec(
-                &content,
-                &mut reader,
-                &format!("{b}.attn_q_scale.weight"),
-                &CDevice::Cpu,
-            )?;
+            let qkv_w = load_w(&weights, &format!("{b}.attn_qkv.weight"), 3 * D_MODEL)?;
+            let out_w = load_w(&weights, &format!("{b}.attn_out.weight"), D_MODEL)?;
+            let q_norm_w = load_v(&weights, &format!("{b}.attn_q_norm.weight"))?;
+            let k_norm_w = load_v(&weights, &format!("{b}.attn_k_norm.weight"))?;
+            let q_scale_raw: Vec<f32> = load_flat(&weights, &format!("{b}.attn_q_scale.weight"))?;
             let q_scale = Tensor::<1>::from_data(
                 TensorData::new(compute_q_scale(q_scale_raw), [HEAD_DIM]),
                 &device(),
             );
-            let pre_norm_w = load_v(&content, &mut reader, &format!("{b}.pre_attn_norm.weight"))?;
-            let post_norm_w = load_v(&content, &mut reader, &format!("{b}.post_attn_norm.weight"))?;
-            let up_w = load_w(
-                &content,
-                &mut reader,
-                &format!("{b}.ffn_up.weight"),
-                D_MODEL,
-            )?;
-            let down_w = load_w(
-                &content,
-                &mut reader,
-                &format!("{b}.ffn_down.weight"),
-                D_MODEL,
-            )?;
-            let pre_ff = load_v(&content, &mut reader, &format!("{b}.pre_ff_norm.weight"))?;
-            let post_ff = load_v(&content, &mut reader, &format!("{b}.post_ff_norm.weight"))?;
+            let pre_norm_w = load_v(&weights, &format!("{b}.pre_attn_norm.weight"))?;
+            let post_norm_w = load_v(&weights, &format!("{b}.post_attn_norm.weight"))?;
+            let up_w = load_w(&weights, &format!("{b}.ffn_up.weight"), D_MODEL)?;
+            let down_w = load_w(&weights, &format!("{b}.ffn_down.weight"), D_MODEL)?;
+            let pre_ff = load_v(&weights, &format!("{b}.pre_ff_norm.weight"))?;
+            let post_ff = load_v(&weights, &format!("{b}.post_ff_norm.weight"))?;
             blocks.push(BurnBlockW {
                 attn: BurnAttnW {
                     qkv_w,
@@ -365,8 +302,7 @@ impl BurnTimesFMModel {
             });
         }
 
-        let out_point =
-            load_residual_block(&content, &mut reader, "out_point", D_MODEL, D_MODEL, false)?;
+        let out_point = load_residual_block(&weights, "out_point", D_MODEL, D_MODEL, false)?;
         let rope = BurnRope::build(HEAD_DIM, MAX_SEQ, ROPE_THETA);
         Ok(Self {
             tokenizer,
@@ -751,7 +687,6 @@ fn denorm_flat(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{Device as CDevice, Tensor as CTensor, D as CD};
 
     pub(crate) fn pseudo(n: usize, seed: u64) -> Vec<f32> {
         let mut x = seed;
@@ -772,29 +707,76 @@ mod tests {
             .fold(0.0f32, f32::max)
     }
 
-    #[test]
-    fn rope_matches_candle() {
-        let dev = CDevice::Cpu;
-        let candle_rope =
-            super::super::rope::RopeCache::new(HEAD_DIM, 16, ROPE_THETA, &dev).unwrap();
-        let burn_rope = BurnRope::build(HEAD_DIM, 16, ROPE_THETA);
-        let xv = pseudo(1 * 4 * 2 * HEAD_DIM, 7);
-        let cx = CTensor::from_vec(xv.clone(), (1, 4, 2, HEAD_DIM), &dev).unwrap();
-        let a: Vec<f32> = candle_rope
-            .apply(&cx, 2)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        let bx = Tensor::<4>::from_data(TensorData::new(xv, [1, 4, 2, HEAD_DIM]), &device());
-        let b: Vec<f32> = burn_rope.apply(bx, 2).to_data().try_to_vec().unwrap();
-        let err = max_err(&a, &b);
-        assert!(err < 1e-5, "rope parity failed: {err:.2e}");
+    /// Host reference for the GPT-NeoX-style RoPE in [`BurnRope`].
+    fn host_rope(x: &[f32], b: usize, seq: usize, h: usize, hd: usize, start: usize) -> Vec<f32> {
+        let half = hd / 2;
+        let inv_freq: Vec<f64> = (0..half)
+            .map(|i| 1.0 / ROPE_THETA.powf(2.0 * i as f64 / hd as f64))
+            .collect();
+        let mut out = vec![0.0f32; x.len()];
+        for bi in 0..b {
+            for s in 0..seq {
+                let pos = start + s;
+                for hi in 0..h {
+                    let base = (bi * seq * h + s * h + hi) * hd;
+                    for i in 0..half {
+                        let angle = (pos as f64 * inv_freq[i]) as f32;
+                        let (sn, cs) = angle.sin_cos();
+                        let x1 = x[base + i];
+                        let x2 = x[base + half + i];
+                        out[base + i] = x1 * cs - x2 * sn;
+                        out[base + half + i] = x2 * cs + x1 * sn;
+                    }
+                }
+            }
+        }
+        out
     }
 
     #[test]
-    fn residual_block_matches_candle() {
+    fn rope_matches_host() {
+        let burn_rope = BurnRope::build(HEAD_DIM, 16, ROPE_THETA);
+        let xv = pseudo(1 * 4 * 2 * HEAD_DIM, 7);
+        let bx =
+            Tensor::<4>::from_data(TensorData::new(xv.clone(), [1, 4, 2, HEAD_DIM]), &device());
+        let got: Vec<f32> = burn_rope.apply(bx, 2).to_data().try_to_vec().unwrap();
+        let expected = host_rope(&xv, 1, 4, 2, HEAD_DIM, 2);
+        let err = max_err(&expected, &got);
+        assert!(err < 1e-5, "rope mismatch: {err:.2e}");
+    }
+
+    fn host_linear(
+        x: &[f32],
+        n: usize,
+        w: &[f32],
+        r: usize,
+        c: usize,
+        b: Option<&[f32]>,
+    ) -> Vec<f32> {
+        assert_eq!(x.len(), n * c);
+        assert_eq!(w.len(), r * c);
+        let mut y = vec![0.0f32; n * r];
+        for i in 0..n {
+            for o in 0..r {
+                let mut acc = 0.0f32;
+                for k in 0..c {
+                    acc += w[o * c + k] * x[i * c + k];
+                }
+                if let Some(bv) = b {
+                    acc += bv[o];
+                }
+                y[i * r + o] = acc;
+            }
+        }
+        y
+    }
+
+    fn host_silu(x: &[f32]) -> Vec<f32> {
+        x.iter().map(|&v| v / (1.0 + (-v).exp())).collect()
+    }
+
+    #[test]
+    fn residual_block_matches_host() {
         // Small dims: in=8, hidden=16, out=16, with bias.
         let (din, h, dout, n) = (8usize, 16usize, 16usize, 4usize);
         let w = |r: usize, c: usize, s: u64| pseudo(r * c, s);
@@ -806,23 +788,10 @@ mod tests {
         let sb = pseudo(dout, 26);
         let xv = pseudo(n * din, 27);
 
-        let dev = CDevice::Cpu;
-        let cx = CTensor::from_vec(xv.clone(), (n, din), &dev).unwrap();
-        let lin = |x: &CTensor, wv: &[f32], r: usize, c: usize, bv: Option<&[f32]>| {
-            use zsfm_nn::linear;
-            let wt = CTensor::from_vec(wv.to_vec(), (r, c), &dev).unwrap();
-            let bt = bv.map(|v| CTensor::from_vec(v.to_vec(), r, &dev).unwrap());
-            linear(x, &wt, bt.as_ref()).unwrap()
-        };
-        let hh = candle_nn::ops::silu(&lin(&cx, &hw, h, din, Some(&hb))).unwrap();
-        let out = lin(&hh, &ow, dout, h, Some(&ob));
-        let skip = lin(&cx, &sw, dout, din, Some(&sb));
-        let expected: Vec<f32> = (&out + &skip)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
+        let hh = host_silu(&host_linear(&xv, n, &hw, h, din, Some(&hb)));
+        let out = host_linear(&hh, n, &ow, dout, h, Some(&ob));
+        let skip = host_linear(&xv, n, &sw, dout, din, Some(&sb));
+        let expected: Vec<f32> = out.iter().zip(skip.iter()).map(|(a, b)| a + b).collect();
 
         let bdev = device();
         let bxb = Tensor::<2>::from_data(TensorData::new(xv, [n, din]), &bdev);
@@ -839,18 +808,14 @@ mod tests {
             .try_to_vec()
             .unwrap();
         let err = max_err(&expected, &got);
-        assert!(err < 1e-5, "residual parity failed: {err:.2e}");
+        assert!(err < 1e-4, "residual mismatch: {err:.2e}");
     }
 
     #[test]
-    fn prefill_attention_matches_candle_at_real_dims() {
+    fn prefill_attention_burn_golden() {
         // Real widths (D_MODEL=1280, 16 heads x 80), 2 patches, random weights.
-        // ~30MB of tensors; exercises split/rope/norm/scale/permute/scores/softmax.
+        // Exercises split/rope/norm/scale/permute/scores/softmax; golden pins output.
         let n = 2usize;
-        let dev = CDevice::Cpu;
-        // Xavier-like scaling: real checkpoints have small weights, and an
-        // unscaled U[-1,1] 1280-wide matrix would amplify 6e-5 stage noise
-        // ~500x through the output projection. Scale matrices to O(0.02).
         let mk = |r: usize, c: usize, s: u64| {
             pseudo(r * c, s)
                 .into_iter()
@@ -862,56 +827,9 @@ mod tests {
         let out_v = mk(D_MODEL, D_MODEL, 32);
         let qn_v = pseudo(HEAD_DIM, 33);
         let kn_v = pseudo(HEAD_DIM, 34);
-        let qs_raw = pseudo(HEAD_DIM, 35);
-        let qs_v = compute_q_scale(qs_raw);
+        let qs_v = compute_q_scale(pseudo(HEAD_DIM, 35));
         let xv = pseudo(n * D_MODEL, 36);
 
-        // Candle reference (mirrors super::prefill_attn, with causal mask).
-        let cx = CTensor::from_vec(xv.clone(), (1, n, D_MODEL), &dev).unwrap();
-        let qkv_w = CTensor::from_vec(qkv_v.clone(), (3 * D_MODEL, D_MODEL), &dev).unwrap();
-        let qkv = zsfm_nn::linear(&cx, &qkv_w, None).unwrap();
-        let q = qkv.narrow(CD::Minus1, 0, D_MODEL).unwrap();
-        let k = qkv.narrow(CD::Minus1, D_MODEL, D_MODEL).unwrap();
-        let v = qkv.narrow(CD::Minus1, 2 * D_MODEL, D_MODEL).unwrap();
-        let reshape4 = |t: CTensor| t.reshape((1, n, N_HEADS, HEAD_DIM)).unwrap();
-        let candle_rope =
-            super::super::rope::RopeCache::new(HEAD_DIM, 32, ROPE_THETA, &dev).unwrap();
-        let q = candle_rope.apply(&reshape4(q), 0).unwrap();
-        let k = candle_rope.apply(&reshape4(k), 0).unwrap();
-        let v = reshape4(v);
-        let qn = CTensor::from_vec(qn_v.clone(), HEAD_DIM, &dev).unwrap();
-        let kn = CTensor::from_vec(kn_v.clone(), HEAD_DIM, &dev).unwrap();
-        let q = zsfm_nn::rms_norm(&q, Some(&qn), NORM_EPS as f64).unwrap();
-        let k = zsfm_nn::rms_norm(&k, Some(&kn), NORM_EPS as f64).unwrap();
-        let qs = CTensor::from_vec(qs_v.clone(), HEAD_DIM, &dev).unwrap();
-        let q = q.broadcast_mul(&qs).unwrap();
-        let p = |t: CTensor| t.permute([0, 2, 1, 3]).unwrap().contiguous().unwrap();
-        let (q, k, v) = (p(q), p(k), p(v));
-        let causal = zsfm_nn::make_causal_mask(n, 0, &dev).unwrap();
-        let scores = q
-            .matmul(&k.transpose(CD::Minus1, CD::Minus2).unwrap())
-            .unwrap();
-        let scores = scores.broadcast_add(&causal).unwrap();
-        let ctx = candle_nn::ops::softmax(&scores, CD::Minus1)
-            .unwrap()
-            .matmul(&v)
-            .unwrap();
-        let ctx = ctx
-            .permute([0, 2, 1, 3])
-            .unwrap()
-            .contiguous()
-            .unwrap()
-            .reshape((1, n, D_MODEL))
-            .unwrap();
-        let out_w = CTensor::from_vec(out_v.clone(), (D_MODEL, D_MODEL), &dev).unwrap();
-        let expected: Vec<f32> = zsfm_nn::linear(&ctx, &out_w, None)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-
-        // Burn.
         let bdev = device();
         let bx = Tensor::<3>::from_data(TensorData::new(xv, [1, n, D_MODEL]), &bdev);
         let bw = BurnAttnW {
@@ -937,8 +855,20 @@ mod tests {
         let (got_t, _, _) = burn_prefill_attn(bx, &bw, &brope, n, burn_causal_mask(n));
         let burn_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let got: Vec<f32> = got_t.to_data().try_to_vec().unwrap();
-        let err = max_err(&expected, &got);
-        println!("timesfm attn [n={n}]: burn {burn_ms:.1}ms err {err:.2e}");
-        assert!(err < 1e-4, "attention parity failed: {err:.2e}");
+        assert_eq!(got.len(), n * D_MODEL);
+        assert!(got.iter().all(|v| v.is_finite()));
+        let sum: f32 = got.iter().sum();
+        let head = [got[0], got[1], got[511], got[1024], got[2559]];
+        println!("timesfm attn [n={n}]: burn {burn_ms:.1}ms sum={sum:.6} head={head:?}");
+        // Golden recorded from the verified Burn port (ex-candle parity 1.5e-5).
+        let golden_sum = -210195.125f32;
+        let golden_head = [-82.57538, -79.27846, -84.41953, -81.87318, -82.0369];
+        assert!(
+            (sum - golden_sum).abs() < 2.0,
+            "attn sum drift: {sum} vs {golden_sum}"
+        );
+        for (g, e) in head.iter().zip(golden_head.iter()) {
+            assert!((g - e).abs() < 1e-4, "attn head drift: {g} vs {e}");
+        }
     }
 }

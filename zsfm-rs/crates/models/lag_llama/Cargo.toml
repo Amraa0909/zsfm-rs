@@ -20,6 +20,7 @@ simdeez.workspace = true
 zsfm-core.workspace = true
 zsfm-nn.workspace = true
 zsfm-gguf.workspace = true
+zsfm-checkpoint.workspace = true
 zsfm-hub.workspace = true
 zsfm-burn.workspace = true
 

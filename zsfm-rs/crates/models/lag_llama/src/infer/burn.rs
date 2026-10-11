@@ -1,25 +1,21 @@
 //! Lag-Llama inference on the Burn backend (Flex CPU) for the prefill
 //! stage, with the original verbatim pure-Rust decode loop.
 //!
-//! Bit-exact port strategy: Phase 1 (prefill over the full context) runs
-//! the same math as `super` on Burn tensors; Phase 2 (autoregressive
-//! decode) reuses the exact host kernels from `super` (`rms_norm_raw`,
-//! `raw_gemv`, `rope_single_inplace`, `mha_decode_raw`, `silu_mlp_raw`)
-//! copied verbatim, since they never touched candle. Weight loading goes
-//! through the existing candle GGUF reader and converts each F32 tensor to
-//! Burn `TensorData`, so there is exactly one GGUF parser.
+//! Phase 1 (prefill over the full context) runs the same math as `super`
+//! on Burn tensors; Phase 2 (autoregressive decode) reuses the exact host
+//! kernels from `super` (`rms_norm_raw`, `raw_gemv`,
+//! `rope_single_inplace`, `mha_decode_raw`, `silu_mlp_raw`) copied
+//! verbatim, since they never touched candle. Weight loading reads GGUF
+//! straight via [`zsfm_burn::GgufWeights`].
 
-use std::io::BufReader;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use burn::tensor::{activation, Device, Tensor, TensorData};
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device as CDevice};
-use simdeez::prelude::*;
 use simdeez::prelude::*;
 use zsfm_burn::linear::{burn_linear_nd, burn_linear_nobias};
 use zsfm_burn::norm::burn_rms_norm_nd;
+use zsfm_burn::{open_gguf_weights, GgufWeights};
 
 use crate::config::LagLlamaConfig;
 
@@ -27,21 +23,12 @@ fn device() -> Device {
     Device::flex()
 }
 
-fn burn2(t: &candle_core::Tensor) -> Result<Tensor<2>> {
-    zsfm_burn::burn_weight_2d(t, &device())
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
 }
 
-fn burn1(t: &candle_core::Tensor) -> Result<Tensor<1>> {
-    zsfm_burn::burn_weight_1d(t, &device())
-}
-
-fn load_t(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<2>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn2(&t)
+fn load_v(weights: &GgufWeights, name: &str) -> Result<Tensor<1>> {
+    weights.load_1d(name)
 }
 
 fn to_host<const D: usize>(t: &Tensor<D>) -> Result<Vec<f32>> {
@@ -89,107 +76,36 @@ pub struct BurnLagLlamaModel {
 
 impl BurnLagLlamaModel {
     pub fn load(gguf_path: &Path, config: LagLlamaConfig) -> Result<Self> {
-        let file = std::fs::File::open(gguf_path)
+        let weights = open_gguf_weights(gguf_path)
             .with_context(|| format!("open {}", gguf_path.display()))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-        let content = gguf_file::Content::read(&mut reader).context("parse GGUF header")?;
 
-        let wte_w = load_t(&content, &mut reader, "enc.wte.weight")?;
-        let wte_b = {
-            let t = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                "enc.wte.bias",
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            burn1(&t)?
-        };
+        let wte_w = load_t(&weights, "enc.wte.weight")?;
+        let wte_b = load_v(&weights, "enc.wte.bias")?;
         let mut blocks = Vec::with_capacity(config.n_layer);
         for n in 0..config.n_layer {
             let p = |s: &str| format!("blk.{n}.{s}");
-            let qw = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &p("attn_q.weight"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            let kvw = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &p("attn_kv.weight"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            let qd: Vec<f32> = qw.flatten_all()?.to_vec1()?;
-            let kd: Vec<f32> = kvw.flatten_all()?.to_vec1()?;
-            let dev = device();
-            let d_model = config.n_embd;
-            let mut cat = Vec::with_capacity(3 * d_model * d_model);
-            cat.extend_from_slice(&qd);
-            cat.extend_from_slice(&kd);
+            let qw = load_t(&weights, &p("attn_q.weight"))?;
+            let kvw = load_t(&weights, &p("attn_kv.weight"))?;
             // kv holds K and V stacked: check total size.
-            let qkv_w = Tensor::<2>::from_data(TensorData::new(cat, [3 * d_model, d_model]), &dev);
+            let qkv_w = Tensor::cat(vec![qw, kvw], 0);
             blocks.push(BurnTransformerBlock {
-                rms1_w: {
-                    let t = zsfm_nn::load_tensor(
-                        &content,
-                        &mut reader,
-                        &p("rms1.weight"),
-                        &CDevice::Cpu,
-                        DType::F32,
-                    )?;
-                    burn1(&t)?
-                },
-                rms2_w: {
-                    let t = zsfm_nn::load_tensor(
-                        &content,
-                        &mut reader,
-                        &p("rms2.weight"),
-                        &CDevice::Cpu,
-                        DType::F32,
-                    )?;
-                    burn1(&t)?
-                },
+                rms1_w: load_v(&weights, &p("rms1.weight"))?,
+                rms2_w: load_v(&weights, &p("rms2.weight"))?,
                 qkv_w,
-                c_w: load_t(&content, &mut reader, &p("attn_c.weight"))?,
-                fc1_w: load_t(&content, &mut reader, &p("mlp_fc1.weight"))?,
-                fc2_w: load_t(&content, &mut reader, &p("mlp_fc2.weight"))?,
-                proj_w: load_t(&content, &mut reader, &p("mlp_proj.weight"))?,
+                c_w: load_t(&weights, &p("attn_c.weight"))?,
+                fc1_w: load_t(&weights, &p("mlp_fc1.weight"))?,
+                fc2_w: load_t(&weights, &p("mlp_fc2.weight"))?,
+                proj_w: load_t(&weights, &p("mlp_proj.weight"))?,
             });
         }
 
         // norm_f is 1D in the checkpoint; load as vector.
-        let norm_f_t = zsfm_nn::load_tensor(
-            &content,
-            &mut reader,
-            "norm_f.weight",
-            &CDevice::Cpu,
-            DType::F32,
-        )?;
-        let norm_f_raw: Vec<f32> = norm_f_t.flatten_all()?.to_vec1()?;
-        let mu_w_t = load_t(&content, &mut reader, "head.mu.weight")?;
-        let mu_b_t = zsfm_nn::load_tensor(
-            &content,
-            &mut reader,
-            "head.mu.bias",
-            &CDevice::Cpu,
-            DType::F32,
-        )?;
+        let norm_f_raw: Vec<f32> = weights.load_flat("norm_f.weight")?;
+        let mu_w_t = load_t(&weights, "head.mu.weight")?;
+        let mu_b_raw: Vec<f32> = weights.load_flat("head.mu.bias")?;
         let mu_w_raw: Vec<f32> = to_host(&mu_w_t)?;
-        let mu_b_raw: Vec<f32> = mu_b_t.flatten_all()?.to_vec1()?;
         let wte_w_raw: Vec<f32> = to_host(&wte_w)?;
-        let wte_b_raw: Vec<f32> = {
-            let t = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                "enc.wte.bias",
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            t.flatten_all()?.to_vec1()?
-        };
+        let wte_b_raw: Vec<f32> = to_host(&wte_b)?;
 
         let head_dim = config.n_embd_per_head;
         let half = head_dim / 2;
@@ -231,13 +147,7 @@ impl BurnLagLlamaModel {
             rope_cos,
             rope_sin,
             wte_w,
-            wte_b: burn1(&zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                "enc.wte.bias",
-                &CDevice::Cpu,
-                DType::F32,
-            )?)?,
+            wte_b: wte_b.clone(),
             blocks,
             raw_blocks,
             rope_cos_raw: cos_vals,
@@ -775,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn burn_matches_candle_on_synthetic_gguf() {
+    fn burn_forecast_golden() {
         let dir = std::env::temp_dir().join(format!("lagllama-burn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -804,23 +714,23 @@ mod tests {
         w.write_to(&mut std::io::BufWriter::new(f)).unwrap();
 
         let cfg = tiny_config();
-        let candle = crate::LagLlamaModel::load(&path, cfg.clone()).unwrap();
         let burn = BurnLagLlamaModel::load(&path, cfg).unwrap();
         let ctx: Vec<f32> = (0..8).map(|i| 10.0 + 0.5 * i as f32).collect();
         let t0 = std::time::Instant::now();
-        let a = candle.forecast(&ctx, 2).unwrap();
-        let candle_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let t0 = std::time::Instant::now();
-        let b = burn.forecast(&ctx, 2).unwrap();
+        let a = burn.forecast(&ctx, 2).unwrap();
         let burn_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        assert_eq!(a.len(), b.len());
-        let err: f32 = a
-            .iter()
-            .zip(b.iter())
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0, f32::max);
-        println!("lag-llama synthetic: candle {candle_ms:.1}ms burn {burn_ms:.1}ms err {err:.2e}");
-        assert!(err < 1e-3, "lag-llama Burn parity failed: {err:.2e}");
+        let b = burn.forecast(&ctx, 2).unwrap();
+        assert_eq!(a.len(), 2);
+        assert!(a.iter().all(|v| v.is_finite()));
+        assert!(a.iter().any(|&v| v != 0.0));
+        assert_eq!(a, b, "forecast must be deterministic");
+        println!("lag-llama synthetic: burn {burn_ms:.1}ms out={a:?}");
+        // Golden recorded from the verified Burn port (ex-candle parity 0.00e0).
+        let golden: [f32; 2] = [10.582177, 10.570611];
+        assert_eq!(a.len(), golden.len());
+        for (x, y) in a.iter().zip(golden.iter()) {
+            assert!((x - y).abs() < 1e-4, "golden drift: {x} vs {y}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

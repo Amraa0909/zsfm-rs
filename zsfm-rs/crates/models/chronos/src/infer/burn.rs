@@ -1,21 +1,18 @@
 //! Chronos-2 inference on the Burn backend (Flex CPU).
 //!
-//! Bit-exact port of `super` (candle): patch embedding with time features,
+//! Bit-exact port of `super`: patch embedding with time features,
 //! encoder blocks (TimeSelfAttention with Llama RoPE + GroupSelfAttention +
-//! FFN), quantile output head. Weight loading goes through the existing
-//! candle GGUF reader and converts each F32 tensor to Burn `TensorData`,
-//! so there is exactly one GGUF parser.
+//! FFN), quantile output head. Weights load straight from GGUF via
+//! [`zsfm_burn::GgufWeights`].
 
-use std::io::BufReader;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use burn::tensor::{activation, Device, Tensor, TensorData};
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device as CDevice};
 use zsfm_burn::linear::burn_linear_nd;
 use zsfm_burn::norm::burn_rms_norm_nd;
 use zsfm_burn::rope::{apply_llama_rope, rope_tables};
+use zsfm_burn::{open_gguf_weights, GgufWeights};
 
 use super::InferConfig;
 
@@ -23,40 +20,16 @@ fn device() -> Device {
     Device::flex()
 }
 
-fn burn2(t: &candle_core::Tensor) -> Result<Tensor<2>> {
-    zsfm_burn::burn_weight_2d(t, &device())
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
 }
 
-fn burn1(t: &candle_core::Tensor) -> Result<Tensor<1>> {
-    zsfm_burn::burn_weight_1d(t, &device())
+fn load_v(weights: &GgufWeights, name: &str) -> Result<Tensor<1>> {
+    weights.load_1d(name)
 }
 
-fn load_t(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<2>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn2(&t)
-}
-
-fn load_v(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<1>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn1(&t)
-}
-
-fn load_w(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-    expected_d_out: usize,
-) -> Result<Tensor<2>> {
-    let t = zsfm_nn::load_weight(content, reader, name, expected_d_out, &CDevice::Cpu)?;
-    burn2(&t)
+fn load_w(weights: &GgufWeights, name: &str, expected_d_out: usize) -> Result<Tensor<2>> {
+    weights.load_weight_2d(name, expected_d_out)
 }
 
 fn linear<const D: usize>(x: Tensor<D>, w: Tensor<2>, b: Option<Tensor<1>>) -> Tensor<D> {
@@ -120,66 +93,36 @@ pub struct BurnChronosModel {
 }
 
 fn load_residual_block(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
+    weights: &GgufWeights,
     prefix: &str,
     d_out_h: usize,
     d_out: usize,
 ) -> Result<BurnResidualBlockW> {
     Ok(BurnResidualBlockW {
-        hidden_w: load_w(content, reader, &format!("{prefix}.hidden.weight"), d_out_h)?,
-        hidden_b: load_v(content, reader, &format!("{prefix}.hidden.bias"))?,
-        output_w: load_w(content, reader, &format!("{prefix}.output.weight"), d_out)?,
-        output_b: load_v(content, reader, &format!("{prefix}.output.bias"))?,
-        skip_w: load_w(content, reader, &format!("{prefix}.skip.weight"), d_out)?,
-        skip_b: load_v(content, reader, &format!("{prefix}.skip.bias"))?,
+        hidden_w: load_w(weights, &format!("{prefix}.hidden.weight"), d_out_h)?,
+        hidden_b: load_v(weights, &format!("{prefix}.hidden.bias"))?,
+        output_w: load_w(weights, &format!("{prefix}.output.weight"), d_out)?,
+        output_b: load_v(weights, &format!("{prefix}.output.bias"))?,
+        skip_w: load_w(weights, &format!("{prefix}.skip.weight"), d_out)?,
+        skip_b: load_v(weights, &format!("{prefix}.skip.bias"))?,
     })
 }
 
 fn load_attn(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
+    weights: &GgufWeights,
     blk: usize,
     kind: &str,
     d_model: usize,
     inner_dim: usize,
 ) -> Result<BurnAttnW> {
-    let dev = device();
-    let qw = zsfm_nn::load_weight(
-        content,
-        reader,
-        &format!("blk.{blk}.{kind}.q.weight"),
-        inner_dim,
-        &CDevice::Cpu,
-    )?;
-    let kw = zsfm_nn::load_weight(
-        content,
-        reader,
-        &format!("blk.{blk}.{kind}.k.weight"),
-        inner_dim,
-        &CDevice::Cpu,
-    )?;
-    let vw = zsfm_nn::load_weight(
-        content,
-        reader,
-        &format!("blk.{blk}.{kind}.v.weight"),
-        inner_dim,
-        &CDevice::Cpu,
-    )?;
-    let mut d = Vec::new();
-    for t in [&qw, &kw, &vw] {
-        d.extend_from_slice(&t.flatten_all()?.to_vec1::<f32>()?);
-    }
-    let qkv_w = Tensor::<2>::from_data(TensorData::new(d, [3 * inner_dim, d_model]), &dev);
+    let qw = load_w(weights, &format!("blk.{blk}.{kind}.q.weight"), inner_dim)?;
+    let kw = load_w(weights, &format!("blk.{blk}.{kind}.k.weight"), inner_dim)?;
+    let vw = load_w(weights, &format!("blk.{blk}.{kind}.v.weight"), inner_dim)?;
+    let qkv_w = Tensor::cat(vec![qw, kw, vw], 0);
     Ok(BurnAttnW {
         qkv_w,
-        o_w: load_w(
-            content,
-            reader,
-            &format!("blk.{blk}.{kind}.o.weight"),
-            d_model,
-        )?,
-        norm_w: load_v(content, reader, &format!("blk.{blk}.{kind}_norm.weight"))?,
+        o_w: load_w(weights, &format!("blk.{blk}.{kind}.o.weight"), d_model)?,
+        norm_w: load_v(weights, &format!("blk.{blk}.{kind}_norm.weight"))?,
     })
 }
 
@@ -198,10 +141,8 @@ impl BurnChronosModel {
     }
 
     pub fn load(gguf_path: &Path, config: InferConfig) -> Result<Self> {
-        let file = std::fs::File::open(gguf_path)
+        let weights = open_gguf_weights(gguf_path)
             .with_context(|| format!("open {}", gguf_path.display()))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-        let content = gguf_file::Content::read(&mut reader).context("parse GGUF header")?;
 
         let d = config.d_model;
         let ff = config.d_ff;
@@ -209,27 +150,27 @@ impl BurnChronosModel {
         let ps = config.patch_size;
         let nq = config.quantiles.len();
 
-        let token_embd = load_t(&content, &mut reader, "token_embd.weight")?;
-        let input_patch = load_residual_block(&content, &mut reader, "input_patch", ff, d)?;
+        let token_embd = load_t(&weights, "token_embd.weight")?;
+        let input_patch = load_residual_block(&weights, "input_patch", ff, d)?;
 
         let mut blocks = Vec::with_capacity(config.num_layers);
         for n in 0..config.num_layers {
-            let time_attn = load_attn(&content, &mut reader, n, "time_attn", d, id)?;
-            let group_attn = load_attn(&content, &mut reader, n, "group_attn", d, id)?;
+            let time_attn = load_attn(&weights, n, "time_attn", d, id)?;
+            let group_attn = load_attn(&weights, n, "group_attn", d, id)?;
             blocks.push(BurnBlockW {
                 time_attn,
                 group_attn,
                 ffn: BurnFfnW {
-                    wi_w: load_w(&content, &mut reader, &format!("blk.{n}.ffn.wi.weight"), ff)?,
-                    wo_w: load_w(&content, &mut reader, &format!("blk.{n}.ffn.wo.weight"), d)?,
-                    norm_w: load_v(&content, &mut reader, &format!("blk.{n}.ffn_norm.weight"))?,
+                    wi_w: load_w(&weights, &format!("blk.{n}.ffn.wi.weight"), ff)?,
+                    wo_w: load_w(&weights, &format!("blk.{n}.ffn.wo.weight"), d)?,
+                    norm_w: load_v(&weights, &format!("blk.{n}.ffn_norm.weight"))?,
                 },
             });
         }
 
-        let enc_norm = load_v(&content, &mut reader, "enc_norm.weight")?;
+        let enc_norm = load_v(&weights, "enc_norm.weight")?;
         let out_d = nq * ps;
-        let output_patch = load_residual_block(&content, &mut reader, "output_patch", ff, out_d)?;
+        let output_patch = load_residual_block(&weights, "output_patch", ff, out_d)?;
 
         let (rope_cos, rope_sin) = rope_tables(config.d_kv, 8192, config.rope_theta, &device())?;
         Ok(Self {
@@ -249,7 +190,7 @@ impl BurnChronosModel {
         let ps = cfg.patch_size;
         let stride = cfg.patch_stride;
         let n_quantiles = cfg.quantiles.len();
-        let n_out_patches = (prediction_length + ps - 1) / ps;
+        let n_out_patches = prediction_length.div_ceil(ps);
 
         let (normalized, loc, scale) = instance_norm(context, cfg.use_arcsinh);
         let padded = pad_for_patching(&normalized, ps);
@@ -261,7 +202,6 @@ impl BurnChronosModel {
             ps,
             stride,
             -((n_ctx_patches * ps) as f32),
-            0.0,
             cfg.time_encoding_scale as f32,
             true,
         );
@@ -417,7 +357,6 @@ fn build_patch_features(
     patch_size: usize,
     stride: usize,
     time_start: f32,
-    _time_end: f32,
     time_scale: f32,
     observed: bool,
 ) -> Vec<f32> {
@@ -554,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn burn_matches_candle_on_synthetic_gguf() {
+    fn burn_forecast_golden() {
         // d=16, id=16, ff=32, ps=4, stride=2, 3 quantiles, 1 layer.
         let dir = std::env::temp_dir().join(format!("chronos-burn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -580,24 +519,33 @@ mod tests {
         w.write_to(&mut std::io::BufWriter::new(f)).unwrap();
 
         let cfg = tiny_config();
-        let candle = crate::ChronosModel::load(&path, cfg.clone()).unwrap();
         let burn = BurnChronosModel::load(&path, cfg).unwrap();
         let ctx: Vec<f32> = (0..8).map(|i| 10.0 + 0.5 * i as f32).collect();
         let t0 = std::time::Instant::now();
-        let a = candle.forecast(&ctx, 4).unwrap();
-        let candle_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let t0 = std::time::Instant::now();
+        let a = burn.forecast(&ctx, 4).unwrap();
+        let ms_a = t0.elapsed().as_secs_f64() * 1000.0;
         let b = burn.forecast(&ctx, 4).unwrap();
-        let burn_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        assert_eq!(a.len(), b.len());
-        let mut err = 0.0f32;
-        for (ra, rb) in a.iter().zip(b.iter()) {
-            for (x, y) in ra.iter().zip(rb.iter()) {
-                err = err.max((x - y).abs());
+        assert_eq!(a.len(), 3);
+        for row in &a {
+            assert_eq!(row.len(), 4);
+        }
+        assert!(a.iter().flatten().all(|v| v.is_finite()));
+        assert!(a.iter().flatten().any(|&v| v != 0.0));
+        assert_eq!(a, b, "forecast must be deterministic");
+        println!("chronos synthetic: burn {ms_a:.3}ms out={a:?}");
+        // Golden values recorded from the verified Burn port (ex-candle parity 1e-4).
+        let golden: [[f32; 4]; 3] = [
+            [9.894369, 8.8220005, 9.853922, 9.345992],
+            [9.070834, 9.884812, 9.241523, 9.49992],
+            [9.611428, 10.309262, 10.598283, 9.180033],
+        ];
+        assert_eq!(a.len(), golden.len());
+        for (row, grow) in a.iter().zip(golden.iter()) {
+            assert_eq!(row.len(), grow.len());
+            for (x, y) in row.iter().zip(grow.iter()) {
+                assert!((x - y).abs() < 1e-4, "golden drift: {x} vs {y}");
             }
         }
-        println!("chronos synthetic: candle {candle_ms:.1}ms burn {burn_ms:.1}ms err {err:.2e}");
-        assert!(err < 1e-4, "chronos Burn parity failed: {err:.2e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

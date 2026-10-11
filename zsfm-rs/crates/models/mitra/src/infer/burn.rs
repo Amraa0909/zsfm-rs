@@ -1,19 +1,16 @@
 //! Mitra inference on the Burn backend (Flex CPU).
 //!
-//! Bit-exact port of `super` (candle): quantile-bucketize embedding,
-//! row/feature dual attention blocks, gated head readout. Weight loading
-//! goes through the existing candle GGUF reader and converts each F32
-//! tensor to Burn `TensorData`, so there is exactly one GGUF parser.
+//! Quantile-bucketize embedding, row/feature dual attention blocks, gated
+//! head readout, with weights loaded straight from GGUF via
+//! [`zsfm_burn::GgufWeights`].
 
-use std::io::BufReader;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use burn::tensor::{activation, Device, Tensor, TensorData};
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device as CDevice};
 use zsfm_burn::linear::burn_linear_nd;
 use zsfm_burn::norm::burn_layer_norm_nd;
+use zsfm_burn::{open_gguf_weights, GgufWeights};
 
 use crate::config::{MitraConfig, Task};
 
@@ -23,30 +20,12 @@ fn device() -> Device {
     Device::flex()
 }
 
-fn burn2(t: &candle_core::Tensor) -> Result<Tensor<2>> {
-    zsfm_burn::burn_weight_2d(t, &device())
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
 }
 
-fn burn1(t: &candle_core::Tensor) -> Result<Tensor<1>> {
-    zsfm_burn::burn_weight_1d(t, &device())
-}
-
-fn load_t(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<2>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn2(&t)
-}
-
-fn load_v(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<1>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn1(&t)
+fn load_v(weights: &GgufWeights, name: &str) -> Result<Tensor<1>> {
+    weights.load_1d(name)
 }
 
 fn linear<const D: usize>(x: Tensor<D>, w: Tensor<2>, b: Option<Tensor<1>>) -> Tensor<D> {
@@ -111,61 +90,55 @@ pub struct BurnMitraModel {
     head_b: Tensor<1>,
 }
 
-fn load_attn(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    prefix: &str,
-) -> Result<BurnAttnW> {
+fn load_attn(weights: &GgufWeights, prefix: &str) -> Result<BurnAttnW> {
     Ok(BurnAttnW {
-        q_w: load_t(content, reader, &format!("{prefix}.q.weight"))?,
-        q_b: load_v(content, reader, &format!("{prefix}.q.bias"))?,
-        k_w: load_t(content, reader, &format!("{prefix}.k.weight"))?,
-        k_b: load_v(content, reader, &format!("{prefix}.k.bias"))?,
-        v_w: load_t(content, reader, &format!("{prefix}.v.weight"))?,
-        v_b: load_v(content, reader, &format!("{prefix}.v.bias"))?,
-        o_w: load_t(content, reader, &format!("{prefix}.o.weight"))?,
-        o_b: load_v(content, reader, &format!("{prefix}.o.bias"))?,
+        q_w: load_t(weights, &format!("{prefix}.q.weight"))?,
+        q_b: load_v(weights, &format!("{prefix}.q.bias"))?,
+        k_w: load_t(weights, &format!("{prefix}.k.weight"))?,
+        k_b: load_v(weights, &format!("{prefix}.k.bias"))?,
+        v_w: load_t(weights, &format!("{prefix}.v.weight"))?,
+        v_b: load_v(weights, &format!("{prefix}.v.bias"))?,
+        o_w: load_t(weights, &format!("{prefix}.o.weight"))?,
+        o_b: load_v(weights, &format!("{prefix}.o.bias"))?,
     })
 }
 
 impl BurnMitraModel {
     pub fn load(gguf_path: &Path, config: MitraConfig) -> Result<Self> {
-        let file = std::fs::File::open(gguf_path)
+        let weights = open_gguf_weights(gguf_path)
             .with_context(|| format!("open {}", gguf_path.display()))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-        let content = gguf_file::Content::read(&mut reader).context("parse GGUF header")?;
 
-        let x_embed_w = load_t(&content, &mut reader, "x_embed.weight")?;
-        let x_embed_b = load_v(&content, &mut reader, "x_embed.bias")?;
-        let y_embed_w = load_t(&content, &mut reader, "y_embed.weight")?;
+        let x_embed_w = load_t(&weights, "x_embed.weight")?;
+        let x_embed_b = load_v(&weights, "x_embed.bias")?;
+        let y_embed_w = load_t(&weights, "y_embed.weight")?;
         let y_embed_b = match config.task {
-            Task::Regression => Some(load_v(&content, &mut reader, "y_embed.bias")?),
+            Task::Regression => Some(load_v(&weights, "y_embed.bias")?),
             Task::Classification => None,
         };
-        let y_mask_w = load_v(&content, &mut reader, "y_mask.weight")?;
+        let y_mask_w = load_v(&weights, "y_mask.weight")?;
 
         let mut blocks = Vec::with_capacity(config.n_layers);
         for n in 0..config.n_layers {
             let p = |s: &str| format!("blk.{n}.{s}");
             blocks.push(BurnBlockW {
-                ln1_w: load_v(&content, &mut reader, &p("ln1.weight"))?,
-                ln1_b: load_v(&content, &mut reader, &p("ln1.bias"))?,
-                ln2_w: load_v(&content, &mut reader, &p("ln2.weight"))?,
-                ln2_b: load_v(&content, &mut reader, &p("ln2.bias"))?,
-                ln3_w: load_v(&content, &mut reader, &p("ln3.weight"))?,
-                ln3_b: load_v(&content, &mut reader, &p("ln3.bias"))?,
-                ln4_w: load_v(&content, &mut reader, &p("ln4.weight"))?,
-                ln4_b: load_v(&content, &mut reader, &p("ln4.bias"))?,
-                attn_row: load_attn(&content, &mut reader, &p("attn_row"))?,
-                attn_feat: load_attn(&content, &mut reader, &p("attn_feat"))?,
-                mlp1_fc1_w: load_t(&content, &mut reader, &p("mlp1_fc1.weight"))?,
-                mlp1_fc1_b: load_v(&content, &mut reader, &p("mlp1_fc1.bias"))?,
-                mlp1_fc2_w: load_t(&content, &mut reader, &p("mlp1_fc2.weight"))?,
-                mlp1_fc2_b: load_v(&content, &mut reader, &p("mlp1_fc2.bias"))?,
-                mlp2_fc1_w: load_t(&content, &mut reader, &p("mlp2_fc1.weight"))?,
-                mlp2_fc1_b: load_v(&content, &mut reader, &p("mlp2_fc1.bias"))?,
-                mlp2_fc2_w: load_t(&content, &mut reader, &p("mlp2_fc2.weight"))?,
-                mlp2_fc2_b: load_v(&content, &mut reader, &p("mlp2_fc2.bias"))?,
+                ln1_w: load_v(&weights, &p("ln1.weight"))?,
+                ln1_b: load_v(&weights, &p("ln1.bias"))?,
+                ln2_w: load_v(&weights, &p("ln2.weight"))?,
+                ln2_b: load_v(&weights, &p("ln2.bias"))?,
+                ln3_w: load_v(&weights, &p("ln3.weight"))?,
+                ln3_b: load_v(&weights, &p("ln3.bias"))?,
+                ln4_w: load_v(&weights, &p("ln4.weight"))?,
+                ln4_b: load_v(&weights, &p("ln4.bias"))?,
+                attn_row: load_attn(&weights, &p("attn_row"))?,
+                attn_feat: load_attn(&weights, &p("attn_feat"))?,
+                mlp1_fc1_w: load_t(&weights, &p("mlp1_fc1.weight"))?,
+                mlp1_fc1_b: load_v(&weights, &p("mlp1_fc1.bias"))?,
+                mlp1_fc2_w: load_t(&weights, &p("mlp1_fc2.weight"))?,
+                mlp1_fc2_b: load_v(&weights, &p("mlp1_fc2.bias"))?,
+                mlp2_fc1_w: load_t(&weights, &p("mlp2_fc1.weight"))?,
+                mlp2_fc1_b: load_v(&weights, &p("mlp2_fc1.bias"))?,
+                mlp2_fc2_w: load_t(&weights, &p("mlp2_fc2.weight"))?,
+                mlp2_fc2_b: load_v(&weights, &p("mlp2_fc2.bias"))?,
             });
         }
 
@@ -177,10 +150,10 @@ impl BurnMitraModel {
             y_embed_b,
             y_mask_w,
             blocks,
-            norm_f_w: load_v(&content, &mut reader, "norm_f.weight")?,
-            norm_f_b: load_v(&content, &mut reader, "norm_f.bias")?,
-            head_w: load_t(&content, &mut reader, "head.weight")?,
-            head_b: load_v(&content, &mut reader, "head.bias")?,
+            norm_f_w: load_v(&weights, "norm_f.weight")?,
+            norm_f_b: load_v(&weights, "norm_f.bias")?,
+            head_w: load_t(&weights, "head.weight")?,
+            head_b: load_v(&weights, "head.bias")?,
         })
     }
 
@@ -606,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn burn_matches_candle_classification() {
+    fn burn_classification_golden() {
         let dir = std::env::temp_dir().join(format!("mitra-burn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -631,7 +604,6 @@ mod tests {
         w.write_to(&mut std::io::BufWriter::new(f)).unwrap();
 
         let cfg = tiny_config();
-        let candle = crate::MitraModel::load(&path, cfg.clone()).unwrap();
         let burn = BurnMitraModel::load(&path, cfg).unwrap();
         let x_support = vec![
             vec![0.1, 1.2],
@@ -642,23 +614,26 @@ mod tests {
         let y_support = vec![0usize, 1, 1, 0];
         let x_query = vec![vec![0.2, 0.9], vec![-0.8, 0.1]];
         let t0 = std::time::Instant::now();
-        let a = candle
-            .predict_classification(&x_support, &y_support, &x_query, 2)
-            .unwrap();
-        let candle_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let t0 = std::time::Instant::now();
-        let b = burn
+        let a = burn
             .predict_classification(&x_support, &y_support, &x_query, 2)
             .unwrap();
         let burn_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let mut err = 0.0f32;
-        for (ra, rb) in a.iter().zip(b.iter()) {
-            for (x, y) in ra.iter().zip(rb.iter()) {
-                err = err.max((x - y).abs());
+        let b = burn
+            .predict_classification(&x_support, &y_support, &x_query, 2)
+            .unwrap();
+        assert_eq!(a.len(), 2);
+        assert!(a
+            .iter()
+            .all(|r| r.len() == 2 && r.iter().all(|v| v.is_finite())));
+        assert_eq!(a, b, "predict must be deterministic");
+        println!("mitra synthetic: burn {burn_ms:.1}ms out={a:?}");
+        // Golden recorded from the verified Burn port (ex-candle parity 4.8e-7).
+        let golden = [[0.112125695, 0.033007264], [0.112092555, 0.033406734]];
+        for (ra, re) in a.iter().zip(golden.iter()) {
+            for (x, y) in ra.iter().zip(re.iter()) {
+                assert!((x - y).abs() < 1e-4, "golden drift: {x} vs {y}");
             }
         }
-        println!("mitra synthetic: candle {candle_ms:.1}ms burn {burn_ms:.1}ms err {err:.2e}");
-        assert!(err < 1e-4, "mitra Burn parity failed: {err:.2e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

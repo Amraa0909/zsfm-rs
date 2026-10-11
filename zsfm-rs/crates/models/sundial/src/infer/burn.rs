@@ -1,21 +1,17 @@
 //! Sundial inference on the Burn backend (Flex CPU).
 //!
-//! Bit-exact port of `super` (candle): patch embedding, transformer blocks
-//! with Llama-style RoPE, and the flow-matching ODE sampler (Heun). Weight
-//! loading goes through the existing candle GGUF reader and converts each
-//! F32 tensor to Burn `TensorData`, so there is exactly one GGUF parser.
-//! Architecture widths mirror the fixed constants in `super`; layer counts
-//! come from GGUF metadata exactly like the candle path.
+//! Patch embedding, transformer blocks with Llama-style RoPE, and the
+//! flow-matching ODE sampler (Heun), with weights loaded straight from GGUF
+//! via [`zsfm_burn::GgufWeights`]. Architecture widths mirror the fixed
+//! constants; layer counts come from GGUF metadata.
 
-use std::io::BufReader;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use burn::tensor::{activation, Device, Tensor, TensorData};
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device as CDevice};
 use zsfm_burn::linear::burn_linear_nd;
 use zsfm_burn::norm::burn_layer_norm_nd;
+use zsfm_burn::{open_gguf_weights, GgufWeights};
 
 const N_HEADS: usize = 12;
 const HEAD_DIM: usize = 64;
@@ -29,30 +25,12 @@ fn device() -> Device {
     Device::flex()
 }
 
-fn burn2(t: &candle_core::Tensor) -> Result<Tensor<2>> {
-    zsfm_burn::burn_weight_2d(t, &device())
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
 }
 
-fn burn1(t: &candle_core::Tensor) -> Result<Tensor<1>> {
-    zsfm_burn::burn_weight_1d(t, &device())
-}
-
-fn load_t(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<2>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn2(&t)
-}
-
-fn load_v(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<1>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn1(&t)
+fn load_v(weights: &GgufWeights, name: &str) -> Result<Tensor<1>> {
+    weights.load_1d(name)
 }
 
 fn linear<const D: usize>(x: Tensor<D>, w: Tensor<2>, b: Option<Tensor<1>>) -> Tensor<D> {
@@ -140,13 +118,8 @@ pub struct BurnSundialModel {
     t_emb_table: Vec<Tensor<1>>,
 }
 
-fn get_u32(content: &gguf_file::Content, key: &str) -> Option<u32> {
-    use candle_core::quantized::gguf_file::Value;
-    match content.metadata.get(key) {
-        Some(Value::U32(v)) => Some(*v),
-        Some(Value::U64(v)) => Some(*v as u32),
-        _ => None,
-    }
+fn get_u32(weights: &GgufWeights, key: &str) -> Option<u32> {
+    weights.meta_u32(key)
 }
 
 fn sinusoidal_embed(t: f32, dim: usize) -> Vec<f32> {
@@ -167,140 +140,87 @@ fn sinusoidal_embed(t: f32, dim: usize) -> Vec<f32> {
 
 impl BurnSundialModel {
     pub fn load(path: &Path, steps_override: Option<usize>) -> Result<Self> {
-        let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-        let content = gguf_file::Content::read(&mut reader).context("parse GGUF header")?;
+        let weights =
+            open_gguf_weights(path).with_context(|| format!("open {}", path.display()))?;
 
-        let n_layers = get_u32(&content, "sundial1.block_count").unwrap_or(12) as usize;
+        let n_layers = get_u32(&weights, "sundial1.block_count").unwrap_or(12) as usize;
         let gguf_n_steps =
-            get_u32(&content, "sundial1.flow.num_sampling_steps").unwrap_or(50) as usize;
+            get_u32(&weights, "sundial1.flow.num_sampling_steps").unwrap_or(50) as usize;
         let n_steps = steps_override.unwrap_or(gguf_n_steps);
-        let flow_depth = get_u32(&content, "sundial1.flow.depth").unwrap_or(3) as usize;
-        let output_len = get_u32(&content, "sundial1.output_token_len").unwrap_or(720) as usize;
+        let flow_depth = get_u32(&weights, "sundial1.flow.depth").unwrap_or(3) as usize;
+        let output_len = get_u32(&weights, "sundial1.output_token_len").unwrap_or(720) as usize;
 
         let embed = BurnEmbedW {
-            hidden_w: load_t(&content, &mut reader, "embed.hidden.weight")?,
-            hidden_b: load_v(&content, &mut reader, "embed.hidden.bias")?,
-            output_w: load_t(&content, &mut reader, "embed.output.weight")?,
-            output_b: load_v(&content, &mut reader, "embed.output.bias")?,
-            skip_w: load_t(&content, &mut reader, "embed.skip.weight")?,
-            skip_b: load_v(&content, &mut reader, "embed.skip.bias")?,
+            hidden_w: load_t(&weights, "embed.hidden.weight")?,
+            hidden_b: load_v(&weights, "embed.hidden.bias")?,
+            output_w: load_t(&weights, "embed.output.weight")?,
+            output_b: load_v(&weights, "embed.output.bias")?,
+            skip_w: load_t(&weights, "embed.skip.weight")?,
+            skip_b: load_v(&weights, "embed.skip.bias")?,
         };
 
         let mut blocks = Vec::with_capacity(n_layers);
         for n in 0..n_layers {
-            let qw = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &format!("blk.{n}.attn_q.weight"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            let kw = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &format!("blk.{n}.attn_k.weight"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            let vw = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &format!("blk.{n}.attn_v.weight"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            let qb = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &format!("blk.{n}.attn_q.bias"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            let kb = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &format!("blk.{n}.attn_k.bias"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            let vb = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &format!("blk.{n}.attn_v.bias"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
+            let qw = load_t(&weights, &format!("blk.{n}.attn_q.weight"))?;
+            let kw = load_t(&weights, &format!("blk.{n}.attn_k.weight"))?;
+            let vw = load_t(&weights, &format!("blk.{n}.attn_v.weight"))?;
+            let qb = load_v(&weights, &format!("blk.{n}.attn_q.bias"))?;
+            let kb = load_v(&weights, &format!("blk.{n}.attn_k.bias"))?;
+            let vb = load_v(&weights, &format!("blk.{n}.attn_v.bias"))?;
             let dev = device();
-            let flat1 =
-                |t: &candle_core::Tensor| -> Result<Vec<f32>> { Ok(t.flatten_all()?.to_vec1()?) };
-            let mut wcat = Vec::new();
-            for t in [&qw, &kw, &vw] {
-                wcat.extend_from_slice(&flat1(t)?);
-            }
-            let qkv_w = Tensor::<2>::from_data(
-                TensorData::new(wcat, [qw.dim(0)? + kw.dim(0)? + vw.dim(0)?, qw.dim(1)?]),
-                &dev,
-            );
-            let mut bcat = Vec::new();
-            for t in [&qb, &kb, &vb] {
-                bcat.extend_from_slice(&flat1(t)?);
-            }
-            let qkv_b = Tensor::<1>::from_data(
-                TensorData::new(bcat, [qb.elem_count() + kb.elem_count() + vb.elem_count()]),
-                &dev,
-            );
+            let qkv_w = Tensor::cat(vec![qw, kw, vw], 0);
+            let qkv_b = Tensor::cat(vec![qb, kb, vb], 0);
             blocks.push(BurnBlockW {
                 attn: BurnAttnW {
                     qkv_w,
                     qkv_b,
-                    o_w: load_t(&content, &mut reader, &format!("blk.{n}.attn_out.weight"))?,
+                    o_w: load_t(&weights, &format!("blk.{n}.attn_out.weight"))?,
                 },
                 attn_norm: BurnNormW {
-                    w: load_v(&content, &mut reader, &format!("blk.{n}.attn_norm.weight"))?,
-                    b: load_v(&content, &mut reader, &format!("blk.{n}.attn_norm.bias"))?,
+                    w: load_v(&weights, &format!("blk.{n}.attn_norm.weight"))?,
+                    b: load_v(&weights, &format!("blk.{n}.attn_norm.bias"))?,
                 },
                 ffn_norm: BurnNormW {
-                    w: load_v(&content, &mut reader, &format!("blk.{n}.ffn_norm.weight"))?,
-                    b: load_v(&content, &mut reader, &format!("blk.{n}.ffn_norm.bias"))?,
+                    w: load_v(&weights, &format!("blk.{n}.ffn_norm.weight"))?,
+                    b: load_v(&weights, &format!("blk.{n}.ffn_norm.bias"))?,
                 },
-                gate_w: load_t(&content, &mut reader, &format!("blk.{n}.ffn_gate.weight"))?,
-                up_w: load_t(&content, &mut reader, &format!("blk.{n}.ffn_up.weight"))?,
-                down_w: load_t(&content, &mut reader, &format!("blk.{n}.ffn_down.weight"))?,
+                gate_w: load_t(&weights, &format!("blk.{n}.ffn_gate.weight"))?,
+                up_w: load_t(&weights, &format!("blk.{n}.ffn_up.weight"))?,
+                down_w: load_t(&weights, &format!("blk.{n}.ffn_down.weight"))?,
             });
         }
 
-        let norm_w = load_v(&content, &mut reader, "norm.weight")?;
-        let norm_b = load_v(&content, &mut reader, "norm.bias")?;
+        let norm_w = load_v(&weights, "norm.weight")?;
+        let norm_b = load_v(&weights, "norm.bias")?;
 
         let mut res_blocks = Vec::with_capacity(flow_depth);
         for k in 0..flow_depth {
             let fp = |s: &str| format!("flow.res.{k}.{s}");
             res_blocks.push(BurnFlowResW {
-                ln_w: load_v(&content, &mut reader, &fp("ln.weight"))?,
-                ln_b: load_v(&content, &mut reader, &fp("ln.bias"))?,
-                mlp1_w: load_t(&content, &mut reader, &fp("mlp1.weight"))?,
-                mlp1_b: load_v(&content, &mut reader, &fp("mlp1.bias"))?,
-                mlp2_w: load_t(&content, &mut reader, &fp("mlp2.weight"))?,
-                mlp2_b: load_v(&content, &mut reader, &fp("mlp2.bias"))?,
-                adaln_w: load_t(&content, &mut reader, &fp("adaln.weight"))?,
-                adaln_b: load_v(&content, &mut reader, &fp("adaln.bias"))?,
+                ln_w: load_v(&weights, &fp("ln.weight"))?,
+                ln_b: load_v(&weights, &fp("ln.bias"))?,
+                mlp1_w: load_t(&weights, &fp("mlp1.weight"))?,
+                mlp1_b: load_v(&weights, &fp("mlp1.bias"))?,
+                mlp2_w: load_t(&weights, &fp("mlp2.weight"))?,
+                mlp2_b: load_v(&weights, &fp("mlp2.bias"))?,
+                adaln_w: load_t(&weights, &fp("adaln.weight"))?,
+                adaln_b: load_v(&weights, &fp("adaln.bias"))?,
             });
         }
         let flow = BurnFlowW {
-            t1_w: load_t(&content, &mut reader, "flow.t_proj1.weight")?,
-            t1_b: load_v(&content, &mut reader, "flow.t_proj1.bias")?,
-            t2_w: load_t(&content, &mut reader, "flow.t_proj2.weight")?,
-            t2_b: load_v(&content, &mut reader, "flow.t_proj2.bias")?,
-            cond_w: load_t(&content, &mut reader, "flow.cond.weight")?,
-            cond_b: load_v(&content, &mut reader, "flow.cond.bias")?,
-            in_w: load_t(&content, &mut reader, "flow.in_proj.weight")?,
-            in_b: load_v(&content, &mut reader, "flow.in_proj.bias")?,
+            t1_w: load_t(&weights, "flow.t_proj1.weight")?,
+            t1_b: load_v(&weights, "flow.t_proj1.bias")?,
+            t2_w: load_t(&weights, "flow.t_proj2.weight")?,
+            t2_b: load_v(&weights, "flow.t_proj2.bias")?,
+            cond_w: load_t(&weights, "flow.cond.weight")?,
+            cond_b: load_v(&weights, "flow.cond.bias")?,
+            in_w: load_t(&weights, "flow.in_proj.weight")?,
+            in_b: load_v(&weights, "flow.in_proj.bias")?,
             res: res_blocks,
-            out_w: load_t(&content, &mut reader, "flow.out_linear.weight")?,
-            out_b: load_v(&content, &mut reader, "flow.out_linear.bias")?,
-            out_adaln_w: load_t(&content, &mut reader, "flow.out_adaln.weight")?,
-            out_adaln_b: load_v(&content, &mut reader, "flow.out_adaln.bias")?,
+            out_w: load_t(&weights, "flow.out_linear.weight")?,
+            out_b: load_v(&weights, "flow.out_linear.bias")?,
+            out_adaln_w: load_t(&weights, "flow.out_adaln.weight")?,
+            out_adaln_b: load_v(&weights, "flow.out_adaln.bias")?,
         };
 
         let (rope_cos, rope_sin) = build_rope_tables(HEAD_DIM, MAX_SEQ, ROPE_THETA);
@@ -581,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn burn_matches_candle_on_synthetic_gguf() {
+    fn burn_forecast_golden() {
         // Real widths (768/12x64), 1 layer, depth 1, 2 ODE steps, output 4.
         let dir = std::env::temp_dir().join(format!("sundial-burn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -641,23 +561,22 @@ mod tests {
         let f = std::fs::File::create(&path).unwrap();
         w.write_to(&mut std::io::BufWriter::new(f)).unwrap();
 
-        let candle = crate::SundialModel::load(&path, &candle_core::Device::Cpu, None).unwrap();
         let burn = BurnSundialModel::load(&path, None).unwrap();
         let ctx: Vec<f32> = (0..16).map(|i| 10.0 + 0.5 * i as f32).collect();
         let t0 = std::time::Instant::now();
-        let a = candle.forecast(&ctx, &candle_core::Device::Cpu).unwrap();
-        let candle_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let t0 = std::time::Instant::now();
-        let b = burn.forecast(&ctx).unwrap();
+        let a = burn.forecast(&ctx).unwrap();
         let burn_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        assert_eq!(a.len(), b.len());
-        let err: f32 = a
-            .iter()
-            .zip(b.iter())
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0, f32::max);
-        println!("sundial synthetic: candle {candle_ms:.1}ms burn {burn_ms:.1}ms err {err:.2e}");
-        assert!(err < 1e-3, "sundial Burn parity failed: {err:.2e}");
+        let b = burn.forecast(&ctx).unwrap();
+        assert_eq!(a.len(), 4);
+        assert!(a.iter().all(|v| v.is_finite()));
+        assert_eq!(a, b, "forecast must be deterministic");
+        println!("sundial synthetic: burn {burn_ms:.1}ms out={a:?}");
+        // Golden recorded from the verified Burn port (ex-candle parity 3.8e-6).
+        let golden: [f32; 4] = [12.953651, 14.637471, 13.848478, 14.506356];
+        assert_eq!(a.len(), golden.len());
+        for (x, y) in a.iter().zip(golden.iter()) {
+            assert!((x - y).abs() < 1e-4, "golden drift: {x} vs {y}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,24 +1,20 @@
 //! TabFM inference on the Burn backend (Flex CPU).
 //!
-//! Bit-exact port of `super` (candle) single-table inference: Fourier cell
-//! embedding, column SetTransformer stacks, row interaction with RoPE,
-//! in-context transformer, decoder head. Weight loading goes through the
-//! existing candle GGUF reader and converts each F32 tensor to Burn
-//! `TensorData`, so there is exactly one GGUF parser.
+//! Single-table inference: Fourier cell embedding, column SetTransformer
+//! stacks, row interaction with RoPE, in-context transformer, decoder head,
+//! with weights loaded straight from GGUF via [`zsfm_burn::GgufWeights`].
 //!
 //! Ensemble orchestration (`ensemble::orchestrate`) is host-level code that
 //! calls `predict_batch`; porting it is a matter of swapping the model type
 //! once this single-table path passes its gate.
 
-use std::io::BufReader;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use burn::tensor::{activation, Device, Tensor, TensorData};
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device as CDevice};
 use zsfm_burn::linear::burn_linear_nd;
 use zsfm_burn::norm::burn_rms_norm_nd;
+use zsfm_burn::{open_gguf_weights, GgufWeights};
 
 use crate::config::TabFMConfig;
 
@@ -26,40 +22,20 @@ fn device() -> Device {
     Device::flex()
 }
 
-fn burn2(t: &candle_core::Tensor) -> Result<Tensor<2>> {
-    zsfm_burn::burn_weight_2d(t, &device())
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
 }
 
-fn burn1(t: &candle_core::Tensor) -> Result<Tensor<1>> {
-    zsfm_burn::burn_weight_1d(t, &device())
+fn load_v(weights: &GgufWeights, name: &str) -> Result<Tensor<1>> {
+    weights.load_1d(name)
 }
 
-fn load_t(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<2>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn2(&t)
+fn load_w(weights: &GgufWeights, name: &str, expected_d_out: usize) -> Result<Tensor<2>> {
+    weights.load_weight_2d(name, expected_d_out)
 }
 
-fn load_v(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<1>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn1(&t)
-}
-
-fn load_w(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-    expected_d_out: usize,
-) -> Result<Tensor<2>> {
-    let t = zsfm_nn::load_weight(content, reader, name, expected_d_out, &CDevice::Cpu)?;
-    burn2(&t)
+fn load_flat(weights: &GgufWeights, name: &str) -> Result<Vec<f32>> {
+    weights.load_flat(name)
 }
 
 fn linear<const D: usize>(x: Tensor<D>, w: Tensor<2>, b: Option<Tensor<1>>) -> Tensor<D> {
@@ -206,42 +182,35 @@ struct BurnInferConfig {
     is_classifier: bool,
 }
 
-fn load_mab(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    prefix: &str,
-    e: usize,
-    ff: usize,
-) -> Result<BurnMabW> {
+fn load_mab(weights: &GgufWeights, prefix: &str, e: usize, ff: usize) -> Result<BurnMabW> {
     let p = |s: &str| format!("{prefix}.{s}");
     Ok(BurnMabW {
-        q_w: load_w(content, reader, &p("attn_q.weight"), e)?,
-        q_b: load_v(content, reader, &p("attn_q.bias"))?,
-        k_w: load_w(content, reader, &p("attn_k.weight"), e)?,
-        k_b: load_v(content, reader, &p("attn_k.bias"))?,
-        v_w: load_w(content, reader, &p("attn_v.weight"), e)?,
-        v_b: load_v(content, reader, &p("attn_v.bias"))?,
-        o_w: load_w(content, reader, &p("attn_o.weight"), e)?,
-        o_b: load_v(content, reader, &p("attn_o.bias"))?,
-        q_norm: load_v(content, reader, &p("q_norm.weight"))?,
-        k_norm: load_v(content, reader, &p("k_norm.weight"))?,
-        per_dim_scale: load_v(content, reader, &p("per_dim_scale"))?,
-        pre_attn_norm: load_v(content, reader, &p("pre_attn_norm.weight"))?,
-        post_attn_norm: load_v(content, reader, &p("post_attn_norm.weight"))?,
-        pre_ff_norm: load_v(content, reader, &p("pre_ff_norm.weight"))?,
-        post_ff_norm: load_v(content, reader, &p("post_ff_norm.weight"))?,
-        ffn_up_w: load_w(content, reader, &p("ffn_up.weight"), ff)?,
-        ffn_up_b: load_v(content, reader, &p("ffn_up.bias"))?,
-        ffn_gate_w: load_w(content, reader, &p("ffn_gate.weight"), ff)?,
-        ffn_gate_b: load_v(content, reader, &p("ffn_gate.bias"))?,
-        ffn_down_w: load_w(content, reader, &p("ffn_down.weight"), e)?,
-        ffn_down_b: load_v(content, reader, &p("ffn_down.bias"))?,
+        q_w: load_w(weights, &p("attn_q.weight"), e)?,
+        q_b: load_v(weights, &p("attn_q.bias"))?,
+        k_w: load_w(weights, &p("attn_k.weight"), e)?,
+        k_b: load_v(weights, &p("attn_k.bias"))?,
+        v_w: load_w(weights, &p("attn_v.weight"), e)?,
+        v_b: load_v(weights, &p("attn_v.bias"))?,
+        o_w: load_w(weights, &p("attn_o.weight"), e)?,
+        o_b: load_v(weights, &p("attn_o.bias"))?,
+        q_norm: load_v(weights, &p("q_norm.weight"))?,
+        k_norm: load_v(weights, &p("k_norm.weight"))?,
+        per_dim_scale: load_v(weights, &p("per_dim_scale"))?,
+        pre_attn_norm: load_v(weights, &p("pre_attn_norm.weight"))?,
+        post_attn_norm: load_v(weights, &p("post_attn_norm.weight"))?,
+        pre_ff_norm: load_v(weights, &p("pre_ff_norm.weight"))?,
+        post_ff_norm: load_v(weights, &p("post_ff_norm.weight"))?,
+        ffn_up_w: load_w(weights, &p("ffn_up.weight"), ff)?,
+        ffn_up_b: load_v(weights, &p("ffn_up.bias"))?,
+        ffn_gate_w: load_w(weights, &p("ffn_gate.weight"), ff)?,
+        ffn_gate_b: load_v(weights, &p("ffn_gate.bias"))?,
+        ffn_down_w: load_w(weights, &p("ffn_down.weight"), e)?,
+        ffn_down_b: load_v(weights, &p("ffn_down.bias"))?,
     })
 }
 
 fn load_col_stack(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
+    weights: &GgufWeights,
     stack: &str,
     num_blocks: usize,
     e: usize,
@@ -249,9 +218,9 @@ fn load_col_stack(
 ) -> Result<BurnColStackW> {
     let mut blocks = Vec::with_capacity(num_blocks);
     for n in 0..num_blocks {
-        let ind_vectors = load_t(content, reader, &format!("{stack}.blk.{n}.ind_vectors"))?;
-        let mab1 = load_mab(content, reader, &format!("{stack}.blk.{n}.mab1"), e, ff)?;
-        let mab2 = load_mab(content, reader, &format!("{stack}.blk.{n}.mab2"), e, ff)?;
+        let ind_vectors = load_t(weights, &format!("{stack}.blk.{n}.ind_vectors"))?;
+        let mab1 = load_mab(weights, &format!("{stack}.blk.{n}.mab1"), e, ff)?;
+        let mab2 = load_mab(weights, &format!("{stack}.blk.{n}.mab2"), e, ff)?;
         blocks.push(BurnInducedBlockW {
             ind_vectors,
             mab1,
@@ -260,66 +229,37 @@ fn load_col_stack(
     }
     Ok(BurnColStackW {
         blocks,
-        out_w_w: load_w(content, reader, &format!("{stack}.out_w.weight"), e)?,
-        out_w_b: load_v(content, reader, &format!("{stack}.out_w.bias"))?,
-        out_norm_w: load_v(content, reader, &format!("{stack}.out_norm.weight"))?,
+        out_w_w: load_w(weights, &format!("{stack}.out_w.weight"), e)?,
+        out_w_b: load_v(weights, &format!("{stack}.out_w.bias"))?,
+        out_norm_w: load_v(weights, &format!("{stack}.out_norm.weight"))?,
     })
 }
 
 fn load_row_stack(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
+    weights: &GgufWeights,
     stack: &str,
     num_blocks: usize,
     e: usize,
     ff: usize,
 ) -> Result<BurnRowStackW> {
-    let rope_freqs: Vec<f32> = zsfm_nn::load_tensor(
-        content,
-        reader,
-        &format!("{stack}.rope_freqs"),
-        &CDevice::Cpu,
-        DType::F32,
-    )?
-    .flatten_all()?
-    .to_vec1()?;
+    let rope_freqs: Vec<f32> = load_flat(weights, &format!("{stack}.rope_freqs"))?;
     let mut blocks = Vec::with_capacity(num_blocks);
     for n in 0..num_blocks {
-        blocks.push(load_mab(
-            content,
-            reader,
-            &format!("{stack}.blk.{n}"),
-            e,
-            ff,
-        )?);
+        blocks.push(load_mab(weights, &format!("{stack}.blk.{n}"), e, ff)?);
     }
     Ok(BurnRowStackW {
         rope_freqs,
         blocks,
-        out_norm_w: load_v(content, reader, &format!("{stack}.out_norm.weight"))?,
+        out_norm_w: load_v(weights, &format!("{stack}.out_norm.weight"))?,
     })
 }
 
-fn load_mlp(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    prefix: &str,
-    dims: &[usize],
-) -> Result<BurnMlpW> {
+fn load_mlp(weights: &GgufWeights, prefix: &str, dims: &[usize]) -> Result<BurnMlpW> {
     let mut layers = Vec::with_capacity(dims.len() - 1);
     for i in 0..dims.len() - 1 {
         let out_dim = dims[i + 1];
-        let w = {
-            let t = zsfm_nn::load_weight(
-                content,
-                reader,
-                &format!("{prefix}.mlp.{i}.weight"),
-                out_dim,
-                &CDevice::Cpu,
-            )?;
-            burn2(&t)?
-        };
-        let b = load_v(content, reader, &format!("{prefix}.mlp.{i}.bias"))?;
+        let w = load_w(weights, &format!("{prefix}.mlp.{i}.weight"), out_dim)?;
+        let b = load_v(weights, &format!("{prefix}.mlp.{i}.bias"))?;
         layers.push((w, b));
     }
     Ok(BurnMlpW { layers })
@@ -359,10 +299,8 @@ impl BurnTabfmRope {
 }
 impl BurnTabFMModel {
     pub fn load(gguf_path: &Path, tc: &TabFMConfig) -> Result<Self> {
-        let file = std::fs::File::open(gguf_path)
+        let weights = open_gguf_weights(gguf_path)
             .with_context(|| format!("open {}", gguf_path.display()))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-        let content = gguf_file::Content::read(&mut reader).context("parse GGUF header")?;
         let e = tc.embed_dim as usize;
         let col_ff = e * tc.ff_factor as usize;
         let icl_dim = e * tc.row_num_cls as usize;
@@ -387,56 +325,27 @@ impl BurnTabFMModel {
             is_classifier: tc.is_classifier,
         };
         let cell = BurnCellW {
-            fourier_freq: load_t(&content, &mut reader, "cell.fourier_freq")?,
-            fourier_freq_cat: load_t(&content, &mut reader, "cell.fourier_freq_cat")?,
-            in_linear_w: load_w(&content, &mut reader, "cell.in_linear.weight", e)?,
-            in_linear_b: load_v(&content, &mut reader, "cell.in_linear.bias")?,
-            in_linear_cat_w: load_w(&content, &mut reader, "cell.in_linear_cat.weight", e)?,
-            in_linear_cat_b: load_v(&content, &mut reader, "cell.in_linear_cat.bias")?,
+            fourier_freq: load_t(&weights, "cell.fourier_freq")?,
+            fourier_freq_cat: load_t(&weights, "cell.fourier_freq_cat")?,
+            in_linear_w: load_w(&weights, "cell.in_linear.weight", e)?,
+            in_linear_b: load_v(&weights, "cell.in_linear.bias")?,
+            in_linear_cat_w: load_w(&weights, "cell.in_linear_cat.weight", e)?,
+            in_linear_cat_b: load_v(&weights, "cell.in_linear_cat.bias")?,
             y_embed: if tc.is_classifier {
-                BurnYEmbedW::Embedding(load_t(&content, &mut reader, "cell.y_embed.weight")?)
+                BurnYEmbedW::Embedding(load_t(&weights, "cell.y_embed.weight")?)
             } else {
-                BurnYEmbedW::Mlp(load_mlp(&content, &mut reader, "cell.y_embed", &[1, 6, e])?)
+                BurnYEmbedW::Mlp(load_mlp(&weights, "cell.y_embed", &[1, 6, e])?)
             },
         };
-        let colenc1 = load_col_stack(
-            &content,
-            &mut reader,
-            "colenc1",
-            tc.col_num_blocks as usize,
-            e,
-            col_ff,
-        )?;
-        let colenc2 = load_col_stack(
-            &content,
-            &mut reader,
-            "colenc2",
-            tc.col_num_blocks as usize,
-            e,
-            col_ff,
-        )?;
-        let rowenc1 = load_row_stack(
-            &content,
-            &mut reader,
-            "rowenc1",
-            tc.row_num_blocks as usize,
-            e,
-            col_ff,
-        )?;
-        let rowenc2 = load_row_stack(
-            &content,
-            &mut reader,
-            "rowenc2",
-            tc.row_num_blocks as usize,
-            e,
-            col_ff,
-        )?;
-        let cls_tokens = load_t(&content, &mut reader, "cls_tokens")?;
+        let colenc1 = load_col_stack(&weights, "colenc1", tc.col_num_blocks as usize, e, col_ff)?;
+        let colenc2 = load_col_stack(&weights, "colenc2", tc.col_num_blocks as usize, e, col_ff)?;
+        let rowenc1 = load_row_stack(&weights, "rowenc1", tc.row_num_blocks as usize, e, col_ff)?;
+        let rowenc2 = load_row_stack(&weights, "rowenc2", tc.row_num_blocks as usize, e, col_ff)?;
+        let cls_tokens = load_t(&weights, "cls_tokens")?;
         let mut icl_blocks = Vec::with_capacity(tc.icl_num_blocks as usize);
         for n in 0..tc.icl_num_blocks as usize {
             icl_blocks.push(load_mab(
-                &content,
-                &mut reader,
+                &weights,
                 &format!("icl.blk.{n}"),
                 icl_dim,
                 icl_ff,
@@ -444,31 +353,20 @@ impl BurnTabFMModel {
         }
         let y_encoder = if tc.is_classifier {
             BurnYEncoderW::OneHot {
-                proj_w: load_w(
-                    &content,
-                    &mut reader,
-                    "icl.y_encoder.projection.weight",
-                    icl_dim,
-                )?,
-                proj_b: load_v(&content, &mut reader, "icl.y_encoder.projection.bias")?,
+                proj_w: load_w(&weights, "icl.y_encoder.projection.weight", icl_dim)?,
+                proj_b: load_v(&weights, "icl.y_encoder.projection.bias")?,
             }
         } else {
             BurnYEncoderW::Mlp(load_mlp(
-                &content,
-                &mut reader,
+                &weights,
                 "icl.y_encoder",
                 &[1, decoder_hidden, icl_dim],
             )?)
         };
-        let decoder = load_mlp(
-            &content,
-            &mut reader,
-            "icl.decoder",
-            &[icl_dim, decoder_hidden, out_dim],
-        )?;
+        let decoder = load_mlp(&weights, "icl.decoder", &[icl_dim, decoder_hidden, out_dim])?;
         let icl = BurnIclW {
             blocks: icl_blocks,
-            out_norm_w: load_v(&content, &mut reader, "icl.out_norm.weight")?,
+            out_norm_w: load_v(&weights, "icl.out_norm.weight")?,
             y_encoder,
             decoder,
         };
@@ -1013,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn burn_matches_candle_single_table() {
+    fn burn_single_table_golden() {
         let dir = std::env::temp_dir().join(format!("tabfm-burn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1072,10 +970,6 @@ mod tests {
         w.write_to(&mut std::io::BufWriter::new(f)).unwrap();
 
         let tc = TabFMConfig::from_json(&tiny_config_json()).unwrap();
-        let candle = crate::TabFMModel::builder(&path)
-            .config_from(&tc)
-            .build()
-            .unwrap();
         let burn = BurnTabFMModel::load(&path, &tc).unwrap();
         let x = vec![
             vec![0.1, 1.2],
@@ -1087,20 +981,27 @@ mod tests {
         ];
         let y = vec![0.0, 1.0, 1.0, 0.0, 0.0, 0.0];
         let t0 = std::time::Instant::now();
-        let a = candle.predict(&x, &y, 4, None, None).unwrap();
-        let candle_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let t0 = std::time::Instant::now();
-        let b = burn.predict(&x, &y, 4, None, None).unwrap();
+        let a = burn.predict(&x, &y, 4, None, None).unwrap();
         let burn_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        assert_eq!(a.len(), b.len());
-        let mut err = 0.0f32;
-        for (ra, rb) in a.iter().zip(b.iter()) {
-            for (u, v) in ra.iter().zip(rb.iter()) {
-                err = err.max((u - v).abs());
+        let b = burn.predict(&x, &y, 4, None, None).unwrap();
+        assert_eq!(a.len(), 6);
+        assert!(a.iter().all(|r| r.iter().all(|v| v.is_finite())));
+        assert_eq!(a, b, "predict must be deterministic");
+        println!("tabfm synthetic: burn {burn_ms:.1}ms out={a:?}");
+        // Golden recorded from the verified Burn port (ex-candle parity 2.9e-4).
+        let golden = [
+            [-0.6438628, 0.015820652],
+            [-0.6436042, 0.016053759],
+            [-0.6436042, 0.016053751],
+            [-0.6438628, 0.015820652],
+            [-0.6616832, -0.001892142],
+            [-0.6616832, -0.0018921569],
+        ];
+        for (ra, re) in a.iter().zip(golden.iter()) {
+            for (u, v) in ra.iter().zip(re.iter()) {
+                assert!((u - v).abs() < 1e-3, "golden drift: {u} vs {v}");
             }
         }
-        println!("tabfm synthetic: candle {candle_ms:.1}ms burn {burn_ms:.1}ms err {err:.2e}");
-        assert!(err < 1e-3, "tabfm Burn parity failed: {err:.2e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

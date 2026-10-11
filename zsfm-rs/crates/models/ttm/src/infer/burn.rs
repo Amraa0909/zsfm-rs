@@ -1,62 +1,26 @@
 //! TinyTimeMixer inference on the Burn backend (Flex CPU).
 //!
-//! Bit-exact port of `super` (candle) `forecast`: same StdScaler, patchify,
-//! mixer math, and inverse scale. Weight loading goes through the existing
-//! candle GGUF reader and converts each F32 tensor to Burn `TensorData`,
-//! so there is exactly one GGUF parser. The parity test below builds a
-//! synthetic GGUF, loads it through both engines, and asserts agreement.
+//! StdScaler → patchify → mixer stack → inverse scale, with weights loaded
+//! straight from GGUF via [`zsfm_burn::GgufWeights`].
 
-use std::io::BufReader;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use burn::tensor::{activation, Device, Tensor, TensorData};
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device as CDevice};
+use zsfm_burn::{open_gguf_weights, GgufWeights};
 
 use crate::config::TtmConfig;
 
-type BDev = Device;
-
-fn device() -> BDev {
+fn device() -> Device {
     Device::flex()
 }
 
-/// Burn tensor from a candle F32 tensor with identical values and shape.
-fn from_candle(t: &candle_core::Tensor) -> Result<Tensor<2>> {
-    let dims = t.dims().to_vec();
-    anyhow::ensure!(dims.len() == 2, "expected 2D weight, got {dims:?}");
-    let data: Vec<f32> = t.flatten_all()?.to_vec1()?;
-    Ok(Tensor::<2>::from_data(
-        TensorData::new(data, [dims[0], dims[1]]),
-        &device(),
-    ))
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
 }
 
-fn from_candle_1(t: &candle_core::Tensor) -> Result<Tensor<1>> {
-    let data: Vec<f32> = t.flatten_all()?.to_vec1()?;
-    Ok(Tensor::<1>::from_data(
-        TensorData::new(data, [t.elem_count()]),
-        &device(),
-    ))
-}
-
-fn load_t(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<2>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    from_candle(&t)
-}
-
-fn load_v(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<1>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    from_candle_1(&t)
+fn load_v(weights: &GgufWeights, name: &str) -> Result<Tensor<1>> {
+    weights.load_1d(name)
 }
 
 struct BurnMixerLayer {
@@ -95,28 +59,24 @@ pub struct BurnTtmModel {
     head_b: Tensor<1>,
 }
 
-fn load_mixer_layer(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    prefix: &str,
-) -> Result<BurnMixerLayer> {
+fn load_mixer_layer(weights: &GgufWeights, prefix: &str) -> Result<BurnMixerLayer> {
     Ok(BurnMixerLayer {
-        patch_norm_w: load_v(content, reader, &format!("{prefix}.patch_norm.weight"))?,
-        patch_norm_b: load_v(content, reader, &format!("{prefix}.patch_norm.bias"))?,
-        patch_fc1_w: load_t(content, reader, &format!("{prefix}.patch_fc1.weight"))?,
-        patch_fc1_b: load_v(content, reader, &format!("{prefix}.patch_fc1.bias"))?,
-        patch_fc2_w: load_t(content, reader, &format!("{prefix}.patch_fc2.weight"))?,
-        patch_fc2_b: load_v(content, reader, &format!("{prefix}.patch_fc2.bias"))?,
-        patch_gate_w: load_t(content, reader, &format!("{prefix}.patch_gate.weight"))?,
-        patch_gate_b: load_v(content, reader, &format!("{prefix}.patch_gate.bias"))?,
-        feat_norm_w: load_v(content, reader, &format!("{prefix}.feat_norm.weight"))?,
-        feat_norm_b: load_v(content, reader, &format!("{prefix}.feat_norm.bias"))?,
-        feat_fc1_w: load_t(content, reader, &format!("{prefix}.feat_fc1.weight"))?,
-        feat_fc1_b: load_v(content, reader, &format!("{prefix}.feat_fc1.bias"))?,
-        feat_fc2_w: load_t(content, reader, &format!("{prefix}.feat_fc2.weight"))?,
-        feat_fc2_b: load_v(content, reader, &format!("{prefix}.feat_fc2.bias"))?,
-        feat_gate_w: load_t(content, reader, &format!("{prefix}.feat_gate.weight"))?,
-        feat_gate_b: load_v(content, reader, &format!("{prefix}.feat_gate.bias"))?,
+        patch_norm_w: load_v(weights, &format!("{prefix}.patch_norm.weight"))?,
+        patch_norm_b: load_v(weights, &format!("{prefix}.patch_norm.bias"))?,
+        patch_fc1_w: load_t(weights, &format!("{prefix}.patch_fc1.weight"))?,
+        patch_fc1_b: load_v(weights, &format!("{prefix}.patch_fc1.bias"))?,
+        patch_fc2_w: load_t(weights, &format!("{prefix}.patch_fc2.weight"))?,
+        patch_fc2_b: load_v(weights, &format!("{prefix}.patch_fc2.bias"))?,
+        patch_gate_w: load_t(weights, &format!("{prefix}.patch_gate.weight"))?,
+        patch_gate_b: load_v(weights, &format!("{prefix}.patch_gate.bias"))?,
+        feat_norm_w: load_v(weights, &format!("{prefix}.feat_norm.weight"))?,
+        feat_norm_b: load_v(weights, &format!("{prefix}.feat_norm.bias"))?,
+        feat_fc1_w: load_t(weights, &format!("{prefix}.feat_fc1.weight"))?,
+        feat_fc1_b: load_v(weights, &format!("{prefix}.feat_fc1.bias"))?,
+        feat_fc2_w: load_t(weights, &format!("{prefix}.feat_fc2.weight"))?,
+        feat_fc2_b: load_v(weights, &format!("{prefix}.feat_fc2.bias"))?,
+        feat_gate_w: load_t(weights, &format!("{prefix}.feat_gate.weight"))?,
+        feat_gate_b: load_v(weights, &format!("{prefix}.feat_gate.bias"))?,
     })
 }
 
@@ -138,13 +98,10 @@ fn softmax_last_dim(x: Tensor<2>) -> Tensor<2> {
 
 impl BurnTtmModel {
     pub fn load(gguf_path: &Path, config: TtmConfig) -> Result<Self> {
-        let file = std::fs::File::open(gguf_path)
-            .with_context(|| format!("open {}", gguf_path.display()))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-        let content = gguf_file::Content::read(&mut reader).context("parse GGUF header")?;
+        let weights = open_gguf_weights(gguf_path)?;
 
-        let patcher_w = load_t(&content, &mut reader, "enc.patcher.weight")?;
-        let patcher_b = load_v(&content, &mut reader, "enc.patcher.bias")?;
+        let patcher_w = load_t(&weights, "enc.patcher.weight")?;
+        let patcher_b = load_v(&weights, "enc.patcher.bias")?;
 
         let n_levels = config.adaptive_patching_levels;
         let mut enc_levels = Vec::with_capacity(n_levels);
@@ -153,26 +110,21 @@ impl BurnTtmModel {
             let mut layers = Vec::with_capacity(config.num_layers);
             for n in 0..config.num_layers {
                 layers.push(load_mixer_layer(
-                    &content,
-                    &mut reader,
+                    &weights,
                     &format!("enc.blk.{l}.layer.{n}"),
                 )?);
             }
             enc_levels.push(BurnAdaptiveLevel { factor, layers });
         }
 
-        let dec_adapter_w = load_t(&content, &mut reader, "dec.adapter.weight")?;
-        let dec_adapter_b = load_v(&content, &mut reader, "dec.adapter.bias")?;
+        let dec_adapter_w = load_t(&weights, "dec.adapter.weight")?;
+        let dec_adapter_b = load_v(&weights, "dec.adapter.bias")?;
         let mut dec_layers = Vec::with_capacity(config.decoder_num_layers);
         for n in 0..config.decoder_num_layers {
-            dec_layers.push(load_mixer_layer(
-                &content,
-                &mut reader,
-                &format!("dec.blk.{n}"),
-            )?);
+            dec_layers.push(load_mixer_layer(&weights, &format!("dec.blk.{n}"))?);
         }
-        let head_w = load_t(&content, &mut reader, "head.weight")?;
-        let head_b = load_v(&content, &mut reader, "head.bias")?;
+        let head_w = load_t(&weights, "head.weight")?;
+        let head_b = load_v(&weights, "head.bias")?;
 
         Ok(Self {
             config,
@@ -370,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn burn_matches_candle_on_synthetic_gguf() {
+    fn burn_forecast_golden() {
         let dir = std::env::temp_dir().join(format!("ttm-burn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -393,25 +345,24 @@ mod tests {
         w.write_to(&mut std::io::BufWriter::new(f)).unwrap();
 
         let cfg = test_config();
-        let candle = crate::TtmModel::load(&path, cfg.clone()).unwrap();
         let burn = BurnTtmModel::load(&path, cfg).unwrap();
 
         let ctx: Vec<f32> = (0..16).map(|i| 10.0 + 0.5 * i as f32).collect();
         let t0 = std::time::Instant::now();
-        let a = candle.forecast(&ctx).unwrap();
-        let candle_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let t0 = std::time::Instant::now();
+        let a = burn.forecast(&ctx).unwrap();
+        let ms_a = t0.elapsed().as_secs_f64() * 1000.0;
         let b = burn.forecast(&ctx).unwrap();
-        let burn_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-        assert_eq!(a.len(), b.len());
-        let err: f32 = a
-            .iter()
-            .zip(b.iter())
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0, f32::max);
-        println!("ttm synthetic: candle {candle_ms:.3}ms burn {burn_ms:.3}ms err {err:.2e}");
-        assert!(err < 1e-4, "ttm Burn parity failed: {err:.2e}");
+        assert_eq!(a.len(), 4);
+        assert!(a.iter().all(|v| v.is_finite()));
+        assert!(a.iter().any(|&v| v != 0.0));
+        assert_eq!(a, b, "forecast must be deterministic");
+        println!("ttm synthetic: burn {ms_a:.3}ms out={a:?}");
+        // Golden values recorded from the verified Burn port (ex-candle parity 3.05e-5).
+        let golden: [f32; 4] = [-414.10815, -425.1715, -473.70477, -365.27527];
+        assert_eq!(a.len(), golden.len());
+        for (x, y) in a.iter().zip(golden.iter()) {
+            assert!((x - y).abs() < 1e-5, "golden drift: {x} vs {y}");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

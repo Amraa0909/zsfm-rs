@@ -1678,9 +1678,9 @@ dependencies = [
 
 [[package]]
 name = "crc32fast"
-version = "1.5.0"
+version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
 dependencies = [
  "cfg-if",
 ]
@@ -3057,6 +3057,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -6044,6 +6045,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pytorch-reader"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef8eb685aa4d3083844a8960f5cfd397a4892f56ac0f4e3265ee2f9b7022824e"
+dependencies = [
+ "byteorder",
+ "crc32fast",
+ "num-traits",
+ "serde",
+ "tar",
+ "thiserror 2.0.19",
+ "zip 8.6.0",
+]
+
+[[package]]
 name = "qoi"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7414,7 +7430,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",
@@ -8077,7 +8093,7 @@ version = "2.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 dependencies = [
- "rand 0.9.5",
+ "rand 0.10.3",
 ]
 
 [[package]]
@@ -8088,6 +8104,12 @@ checksum = "a21cdb0fc8f85c98b1ec812bc4cd69faf6c0fa2fc17d44ea3c2cdd38dc08e999"
 dependencies = [
  "nom 8.0.0",
 ]
+
+[[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
 
 [[package]]
 name = "typenum"
@@ -9366,6 +9388,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "zip"
+version = "8.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap",
+ "memchr",
+ "typed-path",
+]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
+
+[[package]]
 name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9452,7 +9493,8 @@ dependencies = [
  "anyhow",
  "burn",
  "candle-core",
- "zsfm-nn",
+ "zsfm-checkpoint",
+ "zsfm-gguf",
 ]
 
 [[package]]
@@ -9460,9 +9502,9 @@ name = "zsfm-checkpoint"
 version = "0.2.7"
 dependencies = [
  "anyhow",
- "candle-core",
  "half",
  "hdf5-metno",
+ "pytorch-reader",
  "safetensors 0.4.5",
  "serde_json",
  "zip 2.4.2",
@@ -9562,6 +9604,7 @@ dependencies = [
  "serde_json",
  "simdeez",
  "zsfm-burn",
+ "zsfm-checkpoint",
  "zsfm-core",
  "zsfm-gguf",
  "zsfm-hub",
@@ -9828,6 +9871,7 @@ dependencies = [
  "serde_json",
  "simdeez",
  "zsfm-burn",
+ "zsfm-checkpoint",
  "zsfm-core",
  "zsfm-gguf",
  "zsfm-hub",

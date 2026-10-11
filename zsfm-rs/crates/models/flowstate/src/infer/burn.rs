@@ -1,27 +1,23 @@
 //! FlowState-R1 inference on the Burn backend (Flex CPU) for tensor
 //! stages, with the original verbatim host kernels for the SSM core.
 //!
-//! Bit-exact port strategy: projections (embed, B/C, decoder, basis),
-//! activations and norms run on Burn tensors; the diagonal SSM scan
-//! (`ssm_scan_step`), discretization math, RevIN, Legendre basis and
-//! quantile recalibration reuse the exact host code from `super` (copied
-//! verbatim — it never touched candle). Weight loading goes through the
-//! existing candle GGUF reader and converts each F32 tensor to Burn
-//! `TensorData`, so there is exactly one GGUF parser.
+//! Projections (embed, B/C, decoder, basis), activations and norms run on
+//! Burn tensors; the diagonal SSM scan (`ssm_scan_step`), discretization
+//! math, RevIN, Legendre basis and quantile recalibration reuse the exact
+//! host code from `super` (copied verbatim — it never touched candle).
+//! Weight loading reads GGUF straight via [`zsfm_burn::GgufWeights`].
 
 use std::collections::HashMap;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use burn::tensor::{activation, Device, Tensor, TensorData};
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device as CDevice};
 use simdeez::prelude::*;
 use zsfm_burn::linear::burn_linear_nd;
 use zsfm_burn::norm::burn_layer_norm_nd;
 use zsfm_burn::norm::burn_rms_norm_nd;
+use zsfm_burn::{open_gguf_weights, GgufWeights};
 
 use super::InferConfig;
 
@@ -29,38 +25,16 @@ fn device() -> Device {
     Device::flex()
 }
 
-fn burn2(t: &candle_core::Tensor) -> Result<Tensor<2>> {
-    zsfm_burn::burn_weight_2d(t, &device())
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
 }
 
-fn burn1(t: &candle_core::Tensor) -> Result<Tensor<1>> {
-    zsfm_burn::burn_weight_1d(t, &device())
+fn load_v(weights: &GgufWeights, name: &str) -> Result<Tensor<1>> {
+    weights.load_1d(name)
 }
 
-fn load_t(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<2>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn2(&t)
-}
-
-fn load_v(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<1>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn1(&t)
-}
-
-fn load_f32_vec(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Vec<f32>> {
-    Ok(zsfm_nn::load_vec(content, reader, name, &CDevice::Cpu)?)
+fn load_f32_vec(weights: &GgufWeights, name: &str) -> Result<Vec<f32>> {
+    weights.load_flat(name)
 }
 
 fn to_host<const D: usize>(t: &Tensor<D>) -> Result<Vec<f32>> {
@@ -174,42 +148,31 @@ pub struct BurnFlowStateModel {
 
 impl BurnFlowStateModel {
     pub fn load(gguf_path: &Path, config: InferConfig) -> Result<Self> {
-        let file = std::fs::File::open(gguf_path)
+        let weights = open_gguf_weights(gguf_path)
             .with_context(|| format!("open {}", gguf_path.display()))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-        let content = gguf_file::Content::read(&mut reader).context("parse GGUF header")?;
 
-        let embed_w = load_t(&content, &mut reader, "embed.weight")?;
-        let embed_b = load_v(&content, &mut reader, "embed.bias")?;
+        let embed_w = load_t(&weights, "embed.weight")?;
+        let embed_b = load_v(&weights, "embed.bias")?;
         let mut blocks = Vec::with_capacity(config.num_layers);
         for n in 0..config.num_layers {
             blocks.push(BurnBlockW {
                 ssm: BurnS5W {
                     log_lambda_real: load_f32_vec(
-                        &content,
-                        &mut reader,
+                        &weights,
                         &format!("blk.{n}.ssm.log_lambda_real"),
                     )?,
-                    lambda_imag: load_f32_vec(
-                        &content,
-                        &mut reader,
-                        &format!("blk.{n}.ssm.lambda_imag"),
-                    )?,
-                    b_r: load_t(&content, &mut reader, &format!("blk.{n}.ssm.b_r"))?,
-                    b_i: load_t(&content, &mut reader, &format!("blk.{n}.ssm.b_i"))?,
-                    c_r: load_t(&content, &mut reader, &format!("blk.{n}.ssm.c_r"))?,
-                    c_i: load_t(&content, &mut reader, &format!("blk.{n}.ssm.c_i"))?,
-                    d: load_v(&content, &mut reader, &format!("blk.{n}.ssm.d"))?,
-                    log_delta: load_f32_vec(
-                        &content,
-                        &mut reader,
-                        &format!("blk.{n}.ssm.log_delta"),
-                    )?,
+                    lambda_imag: load_f32_vec(&weights, &format!("blk.{n}.ssm.lambda_imag"))?,
+                    b_r: load_t(&weights, &format!("blk.{n}.ssm.b_r"))?,
+                    b_i: load_t(&weights, &format!("blk.{n}.ssm.b_i"))?,
+                    c_r: load_t(&weights, &format!("blk.{n}.ssm.c_r"))?,
+                    c_i: load_t(&weights, &format!("blk.{n}.ssm.c_i"))?,
+                    d: load_v(&weights, &format!("blk.{n}.ssm.d"))?,
+                    log_delta: load_f32_vec(&weights, &format!("blk.{n}.ssm.log_delta"))?,
                 },
-                out_weight: load_t(&content, &mut reader, &format!("blk.{n}.out.weight"))?,
-                out_bias: load_v(&content, &mut reader, &format!("blk.{n}.out.bias"))?,
-                norm_weight: load_v(&content, &mut reader, &format!("blk.{n}.norm.weight"))?,
-                norm_bias: load_v(&content, &mut reader, &format!("blk.{n}.norm.bias"))?,
+                out_weight: load_t(&weights, &format!("blk.{n}.out.weight"))?,
+                out_bias: load_v(&weights, &format!("blk.{n}.out.bias"))?,
+                norm_weight: load_v(&weights, &format!("blk.{n}.norm.weight"))?,
+                norm_bias: load_v(&weights, &format!("blk.{n}.norm.bias"))?,
                 disc_cache: Mutex::new(HashMap::new()),
             });
         }
@@ -218,8 +181,8 @@ impl BurnFlowStateModel {
             embed_w,
             embed_b,
             blocks,
-            decoder_w: load_t(&content, &mut reader, "decoder.weight")?,
-            decoder_b: load_v(&content, &mut reader, "decoder.bias")?,
+            decoder_w: load_t(&weights, "decoder.weight")?,
+            decoder_b: load_v(&weights, "decoder.bias")?,
             legendre_cache: Mutex::new(HashMap::new()),
         })
     }
@@ -593,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn burn_matches_candle_on_synthetic_gguf() {
+    fn burn_forecast_golden() {
         let dir = std::env::temp_dir().join(format!("flowstate-burn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -625,24 +588,31 @@ mod tests {
         w.write_to(&mut std::io::BufWriter::new(f)).unwrap();
 
         let cfg = tiny_config();
-        let candle = crate::FlowStateModel::load(&path, cfg.clone()).unwrap();
         let burn = BurnFlowStateModel::load(&path, cfg).unwrap();
         let ctx: Vec<f32> = (0..8).map(|i| 10.0 + 0.5 * i as f32).collect();
         let t0 = std::time::Instant::now();
-        let a = candle.forecast(&ctx, 2).unwrap();
-        let candle_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let t0 = std::time::Instant::now();
-        let b = burn.forecast(&ctx, 2).unwrap();
+        let a = burn.forecast(&ctx, 2).unwrap();
         let burn_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        assert_eq!(a.len(), b.len());
-        let mut err = 0.0f32;
-        for (ra, rb) in a.iter().zip(b.iter()) {
-            for (x, y) in ra.iter().zip(rb.iter()) {
-                err = err.max((x - y).abs());
+        let b = burn.forecast(&ctx, 2).unwrap();
+        assert_eq!(a.len(), 3);
+        assert!(a
+            .iter()
+            .all(|r| r.len() == 2 && r.iter().all(|v| v.is_finite())));
+        assert_eq!(a, b, "forecast must be deterministic");
+        println!("flowstate synthetic: burn {burn_ms:.1}ms out={a:?}");
+        // Golden recorded from the verified Burn port (ex-candle parity 0.00e0).
+        let golden: Vec<Vec<f32>> = vec![
+            vec![11.657719, 11.33724],
+            vec![11.73962, 11.358313],
+            vec![11.769588, 11.490122],
+        ];
+        assert_eq!(a.len(), golden.len());
+        for (ra, re) in a.iter().zip(golden.iter()) {
+            assert_eq!(ra.len(), re.len());
+            for (x, y) in ra.iter().zip(re.iter()) {
+                assert!((x - y).abs() < 1e-4, "golden drift: {x} vs {y}");
             }
         }
-        println!("flowstate synthetic: candle {candle_ms:.1}ms burn {burn_ms:.1}ms err {err:.2e}");
-        assert!(err < 1e-3, "flowstate Burn parity failed: {err:.2e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

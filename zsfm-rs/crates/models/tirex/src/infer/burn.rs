@@ -5,18 +5,15 @@
 //! patching, scaling, SIMD kernels). Only `residual_block_forward` and
 //! `ffn_forward` touch tensors, so this port re-implements just those two
 //! on Burn and reuses every host helper from the parent module via
-//! `super::` (children see parent-private items). Weight loading goes
-//! through the existing candle GGUF reader and converts each F32 tensor to
-//! Burn `TensorData`, so there is exactly one GGUF parser.
+//! `super::` (children see parent-private items). Weight loading reads
+//! GGUF straight via [`zsfm_burn::GgufWeights`].
 
-use std::io::BufReader;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use burn::tensor::{activation, Device, Tensor, TensorData};
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device as CDevice};
 use zsfm_burn::linear::burn_linear_nd;
+use zsfm_burn::{open_gguf_weights, GgufWeights};
 
 use super::{
     adjust_context, compute_ry, headwise_linear_batch_ng, rms_norm_inplace, simd_gate_update,
@@ -28,30 +25,12 @@ fn device() -> Device {
     Device::flex()
 }
 
-fn burn2(t: &candle_core::Tensor) -> Result<Tensor<2>> {
-    zsfm_burn::burn_weight_2d(t, &device())
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
 }
 
-fn burn1(t: &candle_core::Tensor) -> Result<Tensor<1>> {
-    zsfm_burn::burn_weight_1d(t, &device())
-}
-
-fn load_t(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<2>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn2(&t)
-}
-
-fn load_vec(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Vec<f32>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    Ok(t.flatten_all()?.to_vec1()?)
+fn load_vec(weights: &GgufWeights, name: &str) -> Result<Vec<f32>> {
+    weights.load_flat(name)
 }
 
 fn to_host<const D: usize>(t: &Tensor<D>) -> Result<Vec<f32>> {
@@ -89,40 +68,34 @@ pub struct BurnTiRexModel {
     out_emb: BurnEmbedBlock,
 }
 
-fn load_embed_block(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    prefix: &str,
-) -> Result<BurnEmbedBlock> {
+fn load_embed_block(weights: &GgufWeights, prefix: &str) -> Result<BurnEmbedBlock> {
     let p = |s: &str| format!("{prefix}.{s}");
     Ok(BurnEmbedBlock {
-        hidden_w: load_t(content, reader, &p("hidden.weight"))?,
-        hidden_b: load_vec(content, reader, &p("hidden.bias"))?,
-        output_w: load_t(content, reader, &p("output.weight"))?,
-        output_b: load_vec(content, reader, &p("output.bias"))?,
-        residual_w: load_t(content, reader, &p("residual.weight"))?,
-        residual_b: load_vec(content, reader, &p("residual.bias"))?,
+        hidden_w: load_t(weights, &p("hidden.weight"))?,
+        hidden_b: load_vec(weights, &p("hidden.bias"))?,
+        output_w: load_t(weights, &p("output.weight"))?,
+        output_b: load_vec(weights, &p("output.bias"))?,
+        residual_w: load_t(weights, &p("residual.weight"))?,
+        residual_b: load_vec(weights, &p("residual.bias"))?,
     })
 }
 
 impl BurnTiRexModel {
     pub fn load(gguf_path: &Path, config: TiRexConfig) -> Result<Self> {
-        let file = std::fs::File::open(gguf_path)
+        let weights = open_gguf_weights(gguf_path)
             .with_context(|| format!("open {}", gguf_path.display()))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-        let content = gguf_file::Content::read(&mut reader).context("parse GGUF header")?;
 
-        let in_emb = load_embed_block(&content, &mut reader, "in_emb")?;
+        let in_emb = load_embed_block(&weights, "in_emb")?;
         let nh = config.num_heads;
         let dh = config.head_dim();
         let wpp = dh * dh;
         let mut blocks = Vec::with_capacity(config.num_blocks);
         for n in 0..config.num_blocks {
             let p = |s: &str| format!("blk.{n}.{s}");
-            let fgate_w = load_vec(&content, &mut reader, &p("fgate.weight"))?;
-            let igate_w = load_vec(&content, &mut reader, &p("igate.weight"))?;
-            let zgate_w = load_vec(&content, &mut reader, &p("zgate.weight"))?;
-            let ogate_w = load_vec(&content, &mut reader, &p("ogate.weight"))?;
+            let fgate_w = load_vec(&weights, &p("fgate.weight"))?;
+            let igate_w = load_vec(&weights, &p("igate.weight"))?;
+            let zgate_w = load_vec(&weights, &p("zgate.weight"))?;
+            let ogate_w = load_vec(&weights, &p("ogate.weight"))?;
             let mut fizo_w = vec![0.0f32; nh * 4 * wpp];
             for h in 0..nh {
                 fizo_w[h * 4 * wpp..h * 4 * wpp + wpp]
@@ -134,7 +107,7 @@ impl BurnTiRexModel {
                 fizo_w[h * 4 * wpp + 3 * wpp..h * 4 * wpp + 4 * wpp]
                     .copy_from_slice(&ogate_w[h * wpp..(h + 1) * wpp]);
             }
-            let raw_kernel = load_vec(&content, &mut reader, &p("slstm_kernel"))?;
+            let raw_kernel = load_vec(&weights, &p("slstm_kernel"))?;
             let ng = 4usize;
             let mut slstm_kernel_t = vec![0.0f32; nh * ng * dh * dh];
             for head in 0..nh {
@@ -146,19 +119,19 @@ impl BurnTiRexModel {
                 }
             }
             blocks.push(BurnBlock {
-                norm_slstm: load_vec(&content, &mut reader, &p("norm_slstm"))?,
+                norm_slstm: load_vec(&weights, &p("norm_slstm"))?,
                 fizo_w,
                 slstm_kernel_t,
-                slstm_bias: load_vec(&content, &mut reader, &p("slstm_bias"))?,
-                group_norm_w: load_vec(&content, &mut reader, &p("group_norm"))?,
-                norm_ffn: load_vec(&content, &mut reader, &p("norm_ffn"))?,
-                ffn_gate_w: load_t(&content, &mut reader, &p("ffn_gate.weight"))?,
-                ffn_up_w: load_t(&content, &mut reader, &p("ffn_up.weight"))?,
-                ffn_down_w: load_t(&content, &mut reader, &p("ffn_down.weight"))?,
+                slstm_bias: load_vec(&weights, &p("slstm_bias"))?,
+                group_norm_w: load_vec(&weights, &p("group_norm"))?,
+                norm_ffn: load_vec(&weights, &p("norm_ffn"))?,
+                ffn_gate_w: load_t(&weights, &p("ffn_gate.weight"))?,
+                ffn_up_w: load_t(&weights, &p("ffn_up.weight"))?,
+                ffn_down_w: load_t(&weights, &p("ffn_down.weight"))?,
             });
         }
-        let out_norm = load_vec(&content, &mut reader, "out_norm")?;
-        let out_emb = load_embed_block(&content, &mut reader, "out_emb")?;
+        let out_norm = load_vec(&weights, "out_norm")?;
+        let out_emb = load_embed_block(&weights, "out_emb")?;
         Ok(Self {
             config,
             in_emb,
@@ -490,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn burn_matches_candle_on_synthetic_gguf() {
+    fn burn_forecast_golden() {
         let dir = std::env::temp_dir().join(format!("tirex-burn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -522,26 +495,34 @@ mod tests {
         w.write_to(&mut std::io::BufWriter::new(f)).unwrap();
 
         let cfg = tiny_config();
-        let candle = crate::TiRexModel::load(&path, cfg.clone()).unwrap();
         let burn = BurnTiRexModel::load(&path, cfg).unwrap();
         let ctx: Vec<f32> = (0..8).map(|i| 10.0 + 0.5 * i as f32).collect();
         let t0 = std::time::Instant::now();
-        let (aq, am) = candle.forecast(&ctx, 2).unwrap();
-        let candle_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let t0 = std::time::Instant::now();
-        let (bq, bm) = burn.forecast(&ctx, 2).unwrap();
+        let (aq, am) = burn.forecast(&ctx, 2).unwrap();
         let burn_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let mut err = 0.0f32;
-        for (ra, rb) in aq.iter().zip(bq.iter()) {
-            for (x, y) in ra.iter().zip(rb.iter()) {
-                err = err.max((x - y).abs());
+        let (bq, bm) = burn.forecast(&ctx, 2).unwrap();
+        assert_eq!(aq, bq, "quantiles must be deterministic");
+        assert_eq!(am, bm, "median must be deterministic");
+        assert!(aq.iter().all(|r| r.iter().all(|v| v.is_finite())));
+        assert!(am.iter().all(|v| v.is_finite()));
+        println!("tirex synthetic: burn {burn_ms:.1}ms q={aq:?} m={am:?}");
+        // Golden recorded from the verified Burn port (ex-candle parity 0.00e0).
+        let golden_q: Vec<Vec<f32>> = vec![
+            vec![10.033624, 10.955177],
+            vec![10.487212, 9.479774],
+            vec![10.795641, 10.196359],
+        ];
+        let golden_m: Vec<f32> = vec![10.487212, 9.479774];
+        assert_eq!(aq.len(), golden_q.len());
+        assert_eq!(am.len(), golden_m.len());
+        for (ra, re) in aq.iter().zip(golden_q.iter()) {
+            for (x, y) in ra.iter().zip(re.iter()) {
+                assert!((x - y).abs() < 1e-4, "golden drift: {x} vs {y}");
             }
         }
-        for (x, y) in am.iter().zip(bm.iter()) {
-            err = err.max((x - y).abs());
+        for (x, y) in am.iter().zip(golden_m.iter()) {
+            assert!((x - y).abs() < 1e-4, "golden drift: {x} vs {y}");
         }
-        println!("tirex synthetic: candle {candle_ms:.1}ms burn {burn_ms:.1}ms err {err:.2e}");
-        assert!(err < 1e-3, "tirex Burn parity failed: {err:.2e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

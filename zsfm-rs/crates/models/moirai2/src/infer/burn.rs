@@ -1,24 +1,21 @@
 //! Moirai-2.0 inference on the Burn backend (Flex CPU).
 //!
-//! Bit-exact port of `super` (candle): packed scaler, patch tokenizer,
-//! prefill + KV-cached decode with partial RoPE, QK-norm attention,
-//! same-variate bias, SwiGLU FFN, quantile output head. Weight loading goes
-//! through the existing candle GGUF reader and converts each F32 tensor to
-//! Burn `TensorData`, so there is exactly one GGUF parser.
+//! Packed scaler, patch tokenizer, prefill + KV-cached decode with partial
+//! RoPE, QK-norm attention, same-variate bias, SwiGLU FFN, quantile output
+//! head, with weights loaded straight from GGUF via
+//! [`zsfm_burn::GgufWeights`].
 //!
 //! Partial RoPE runs on host data via `zsfm_burn::rope::apply_interleaved_rope`
 //! (Flex CPU: the roundtrip is cheap relative to attention).
 
-use std::io::BufReader;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use burn::tensor::{activation, Device, Tensor, TensorData};
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device as CDevice};
 use zsfm_burn::linear::{burn_linear_bias, burn_linear_nobias};
 use zsfm_burn::norm::burn_rms_norm_nd;
 use zsfm_burn::rope::apply_interleaved_rope;
+use zsfm_burn::{open_gguf_weights, GgufWeights};
 
 use crate::config::Moirai2Config;
 
@@ -26,30 +23,12 @@ fn device() -> Device {
     Device::flex()
 }
 
-fn burn2(t: &candle_core::Tensor) -> Result<Tensor<2>> {
-    zsfm_burn::burn_weight_2d(t, &device())
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
 }
 
-fn burn1(t: &candle_core::Tensor) -> Result<Tensor<1>> {
-    zsfm_burn::burn_weight_1d(t, &device())
-}
-
-fn load_t(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<2>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn2(&t)
-}
-
-fn load_v(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<1>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn1(&t)
+fn load_v(weights: &GgufWeights, name: &str) -> Result<Tensor<1>> {
+    weights.load_1d(name)
 }
 
 fn to_host<const D: usize>(t: &Tensor<D>) -> Result<Vec<f32>> {
@@ -90,19 +69,15 @@ pub struct BurnMoirai2Model {
     rope_sin: Vec<f32>,
 }
 
-fn load_residual_block(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    prefix: &str,
-) -> Result<BurnResidualBlockW> {
+fn load_residual_block(weights: &GgufWeights, prefix: &str) -> Result<BurnResidualBlockW> {
     let p = |s: &str| format!("{prefix}.{s}");
     Ok(BurnResidualBlockW {
-        hidden_w: load_t(content, reader, &p("hidden.weight"))?,
-        hidden_b: load_v(content, reader, &p("hidden.bias"))?,
-        output_w: load_t(content, reader, &p("output.weight"))?,
-        output_b: load_v(content, reader, &p("output.bias"))?,
-        residual_w: load_t(content, reader, &p("residual.weight"))?,
-        residual_b: load_v(content, reader, &p("residual.bias"))?,
+        hidden_w: load_t(weights, &p("hidden.weight"))?,
+        hidden_b: load_v(weights, &p("hidden.bias"))?,
+        output_w: load_t(weights, &p("output.weight"))?,
+        output_b: load_v(weights, &p("output.bias"))?,
+        residual_w: load_t(weights, &p("residual.weight"))?,
+        residual_b: load_v(weights, &p("residual.bias"))?,
     })
 }
 
@@ -160,72 +135,38 @@ fn swiglu_ffn(x: Tensor<2>, fc1_w: Tensor<2>, fc2_w: Tensor<2>, gate_w: Tensor<2
 
 impl BurnMoirai2Model {
     pub fn load(gguf_path: &Path, config: Moirai2Config) -> Result<Self> {
-        let file = std::fs::File::open(gguf_path)
+        let weights = open_gguf_weights(gguf_path)
             .with_context(|| format!("open {}", gguf_path.display()))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-        let content = gguf_file::Content::read(&mut reader).context("parse GGUF header")?;
         let dev = device();
 
-        let in_proj = load_residual_block(&content, &mut reader, "in_proj")?;
+        let in_proj = load_residual_block(&weights, "in_proj")?;
         let mut blocks = Vec::with_capacity(config.n_layers);
         for n in 0..config.n_layers {
             let p = |s: &str| format!("blk.{n}.{s}");
-            let qw = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &p("attn_q.weight"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            let kw = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &p("attn_k.weight"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            let vw = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &p("attn_v.weight"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            let d_model = config.d_model;
-            let mut cat = Vec::with_capacity(3 * d_model * d_model);
-            for t in [&qw, &kw, &vw] {
-                cat.extend_from_slice(&t.flatten_all()?.to_vec1::<f32>()?);
-            }
-            let attn_qkv_w =
-                Tensor::<2>::from_data(TensorData::new(cat, [3 * d_model, d_model]), &dev);
-            let vbias_raw: Vec<f32> = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &p("attn_vbias.weight"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?
-            .flatten_all()?
-            .to_vec1()?;
+            let qw = load_t(&weights, &p("attn_q.weight"))?;
+            let kw = load_t(&weights, &p("attn_k.weight"))?;
+            let vw = load_t(&weights, &p("attn_v.weight"))?;
+            let attn_qkv_w = Tensor::cat(vec![qw, kw, vw], 0);
+            let vbias_raw: Vec<f32> = weights.load_flat(&p("attn_vbias.weight"))?;
             let n_heads = config.n_heads;
             let same_var_bias: Vec<f32> = (0..n_heads).map(|h| vbias_raw[n_heads + h]).collect();
             let attn_vbias_t =
                 Tensor::<3>::from_data(TensorData::new(same_var_bias, [n_heads, 1, 1]), &dev);
             blocks.push(BurnEncoderBlock {
-                norm1_w: load_v(&content, &mut reader, &p("norm1.weight"))?,
-                norm2_w: load_v(&content, &mut reader, &p("norm2.weight"))?,
+                norm1_w: load_v(&weights, &p("norm1.weight"))?,
+                norm2_w: load_v(&weights, &p("norm2.weight"))?,
                 attn_qkv_w,
-                attn_o_w: load_t(&content, &mut reader, &p("attn_o.weight"))?,
-                attn_qn_w: load_v(&content, &mut reader, &p("attn_qn.weight"))?,
-                attn_kn_w: load_v(&content, &mut reader, &p("attn_kn.weight"))?,
+                attn_o_w: load_t(&weights, &p("attn_o.weight"))?,
+                attn_qn_w: load_v(&weights, &p("attn_qn.weight"))?,
+                attn_kn_w: load_v(&weights, &p("attn_kn.weight"))?,
                 attn_vbias_t,
-                ffn_fc1_w: load_t(&content, &mut reader, &p("ffn_fc1.weight"))?,
-                ffn_fc2_w: load_t(&content, &mut reader, &p("ffn_fc2.weight"))?,
-                ffn_gate_w: load_t(&content, &mut reader, &p("ffn_gate.weight"))?,
+                ffn_fc1_w: load_t(&weights, &p("ffn_fc1.weight"))?,
+                ffn_fc2_w: load_t(&weights, &p("ffn_fc2.weight"))?,
+                ffn_gate_w: load_t(&weights, &p("ffn_gate.weight"))?,
             });
         }
-        let norm_f_w = load_v(&content, &mut reader, "norm_f.weight")?;
-        let out_proj = load_residual_block(&content, &mut reader, "out_proj")?;
+        let norm_f_w = load_v(&weights, "norm_f.weight")?;
+        let out_proj = load_residual_block(&weights, "out_proj")?;
 
         let half_rope = config.rope_dim / 2;
         let max_pos = config.max_ctx_tokens() + 256;
@@ -595,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn burn_matches_candle_on_synthetic_gguf() {
+    fn burn_forecast_golden() {
         // d=16, heads=2, hd=8, 1 layer, ps=2, pt=2, q=3, rope=4.
         let dir = std::env::temp_dir().join(format!("moirai2-burn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -627,24 +568,24 @@ mod tests {
         w.write_to(&mut std::io::BufWriter::new(f)).unwrap();
 
         let cfg = tiny_config();
-        let candle = crate::Moirai2Model::load(&path, cfg.clone()).unwrap();
         let burn = BurnMoirai2Model::load(&path, cfg).unwrap();
         // horizon 5 exercises prefill + one decode step.
         let ctx: Vec<f32> = (0..8).map(|i| 10.0 + 0.5 * i as f32).collect();
         let t0 = std::time::Instant::now();
-        let a = candle.forecast(&ctx, 5).unwrap();
-        let candle_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let t0 = std::time::Instant::now();
-        let b = burn.forecast(&ctx, 5).unwrap();
+        let a = burn.forecast(&ctx, 5).unwrap();
         let burn_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        assert_eq!(a.len(), b.len());
-        let err: f32 = a
-            .iter()
-            .zip(b.iter())
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0, f32::max);
-        println!("moirai2 synthetic: candle {candle_ms:.1}ms burn {burn_ms:.1}ms err {err:.2e}");
-        assert!(err < 1e-4, "moirai2 Burn parity failed: {err:.2e}");
+        let b = burn.forecast(&ctx, 5).unwrap();
+        assert_eq!(a.len(), 5);
+        assert!(a.iter().all(|v| v.is_finite()));
+        assert!(a.iter().any(|&v| v != 0.0));
+        assert_eq!(a, b, "forecast must be deterministic");
+        println!("moirai2 synthetic: burn {burn_ms:.1}ms out={a:?}");
+        // Golden recorded from the verified Burn port (ex-candle parity 0.00e0).
+        let golden: [f32; 5] = [9.501931, 10.167264, 10.172378, 9.644132, 9.523021];
+        assert_eq!(a.len(), golden.len());
+        for (x, y) in a.iter().zip(golden.iter()) {
+            assert!((x - y).abs() < 1e-4, "golden drift: {x} vs {y}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

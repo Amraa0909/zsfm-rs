@@ -5,7 +5,7 @@
 //! - `model.safetensors.index.json` — HF sharded-model index (shards resolved
 //!   relative to the index file)
 //! - `.pt` / `.pth` / `.bin` / `.ckpt` — PyTorch pickle checkpoints (zip-based
-//!   `torch.save` format) via candle's pickle reader
+//!   `torch.save` format) via the hardened `pytorch-reader` crate
 //! - `.npy` / `.npz` — NumPy arrays
 //! - `.gguf` — existing GGUF files (tensors dequantized to F32; metadata carried
 //!   through), which makes dtype re-quantization possible
@@ -19,8 +19,6 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use candle_core::quantized::gguf_file;
-use candle_core::{pickle, DType, Device, Tensor};
 use safetensors::{Dtype as StDtype, SafeTensors};
 
 use zsfm_gguf::GGUFMetaValue;
@@ -287,35 +285,55 @@ fn load_safetensors_index(path: &Path) -> Result<Checkpoint> {
 }
 
 // ---------------------------------------------------------------------------
-// PyTorch pickle
+// PyTorch pickle (via pytorch-reader: hardened limits, no PyTorch needed)
 // ---------------------------------------------------------------------------
 
 fn load_pickle(path: &Path, opts: &LoadOptions) -> Result<Checkpoint> {
-    let mut named = pickle::read_all_with_key(path, opts.pickle_key.as_deref())
-        .with_context(|| format!("read PyTorch checkpoint {}", path.display()))?;
-
     // Plain `torch.save(model.state_dict())` checkpoints hold tensors at the top
     // level, but wrapper checkpoints (PyTorch Lightning, training states) nest
-    // them under "state_dict" — candle finds nothing at the top level for those,
-    // so retry with the conventional key before giving up.
-    if named.is_empty() && opts.pickle_key.is_none() {
-        if let Ok(retried) = pickle::read_all_with_key(path, Some("state_dict")) {
-            if !retried.is_empty() {
+    // them under "state_dict" — retry with the conventional key before giving up.
+    let reader = match open_pickle_reader(path, opts.pickle_key.as_deref()) {
+        Ok(r) if !r.tensors().is_empty() => r,
+        _ if opts.pickle_key.is_none() => {
+            let retried = open_pickle_reader(path, Some("state_dict"))
+                .with_context(|| format!("read PyTorch checkpoint {}", path.display()))?;
+            if !retried.tensors().is_empty() {
                 eprintln!("note: no top-level tensors — using the \"state_dict\" dict instead");
-                named = retried;
+                retried
+            } else {
+                open_pickle_reader(path, opts.pickle_key.as_deref())
+                    .with_context(|| format!("read PyTorch checkpoint {}", path.display()))?
             }
         }
-    }
+        Err(e) => return Err(e),
+        Ok(r) => r,
+    };
     anyhow::ensure!(
-        !named.is_empty(),
+        !reader.tensors().is_empty(),
         "no tensors found in {} (if the checkpoint nests weights under a custom dict, \
          pass --pickle-key <KEY>)",
         path.display()
     );
 
-    let mut tensors = Vec::with_capacity(named.len());
-    for (name, tensor) in &named {
-        tensors.push(tensor_to_raw(name, tensor)?);
+    let mut names: Vec<String> = reader.tensors().keys().cloned().collect();
+    names.sort();
+    let mut tensors = Vec::with_capacity(names.len());
+    for name in &names {
+        let t = reader
+            .tensors()
+            .get(name)
+            .with_context(|| format!("tensor {name} vanished"))?;
+        let shape: Vec<u64> = t.shape().iter().map(|&d| d as u64).collect();
+        let raw = t
+            .read()
+            .with_context(|| format!("read tensor {name} bytes"))?;
+        let (dtype, data) = pickle_bytes_to_raw(name, t.dtype(), &raw)?;
+        tensors.push(RawTensor {
+            name: name.clone(),
+            shape,
+            dtype,
+            data,
+        });
     }
     Ok(Checkpoint {
         tensors,
@@ -323,25 +341,187 @@ fn load_pickle(path: &Path, opts: &LoadOptions) -> Result<Checkpoint> {
     })
 }
 
+fn open_pickle_reader(path: &Path, key: Option<&str>) -> Result<pytorch_reader::PytorchReader> {
+    let path_str = path.to_string_lossy();
+    match key {
+        Some(k) => pytorch_reader::PytorchReader::with_top_level_key(path_str.as_ref(), k)
+            .with_context(|| format!("read PyTorch checkpoint {}", path.display())),
+        None => pytorch_reader::PytorchReader::new(path_str.as_ref())
+            .with_context(|| format!("read PyTorch checkpoint {}", path.display())),
+    }
+}
+
+/// Map a pickle tensor's bytes to [`RawTensor`] parts. F32/F16/BF16 pass
+/// through exactly; anything else casts to F32 exactly like the safetensors
+/// path above (same rounding, same notes on stderr).
+fn pickle_bytes_to_raw(
+    name: &str,
+    dtype: pytorch_reader::DType,
+    raw: &[u8],
+) -> Result<(SrcDtype, Vec<u8>)> {
+    use pytorch_reader::DType as P;
+    match dtype {
+        P::F32 => Ok((SrcDtype::F32, raw.to_vec())),
+        P::F16 => Ok((SrcDtype::F16, raw.to_vec())),
+        P::BF16 => Ok((SrcDtype::BF16, raw.to_vec())),
+        P::F64 => Ok((
+            SrcDtype::F32,
+            raw.chunks_exact(8)
+                .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32)
+                .collect::<Vec<_>>()
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        )),
+        P::I64 => {
+            eprintln!("note: tensor {name}: casting I64 to F32");
+            Ok((
+                SrcDtype::F32,
+                raw.chunks_exact(8)
+                    .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect(),
+            ))
+        }
+        P::I32 => {
+            eprintln!("note: tensor {name}: casting I32 to F32");
+            Ok((
+                SrcDtype::F32,
+                raw.chunks_exact(4)
+                    .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as f32)
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect(),
+            ))
+        }
+        P::I16 => {
+            eprintln!("note: tensor {name}: casting I16 to F32");
+            Ok((
+                SrcDtype::F32,
+                raw.chunks_exact(2)
+                    .map(|c| i16::from_le_bytes(c.try_into().unwrap()) as f32)
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect(),
+            ))
+        }
+        P::I8 => {
+            eprintln!("note: tensor {name}: casting I8 to F32");
+            Ok((
+                SrcDtype::F32,
+                f32_to_bytes(&raw.iter().map(|&b| b as i8 as f32).collect::<Vec<_>>()),
+            ))
+        }
+        P::U64 => {
+            eprintln!("note: tensor {name}: casting U64 to F32");
+            Ok((
+                SrcDtype::F32,
+                raw.chunks_exact(8)
+                    .map(|c| u64::from_le_bytes(c.try_into().unwrap()) as f32)
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect(),
+            ))
+        }
+        P::U32 => {
+            eprintln!("note: tensor {name}: casting U32 to F32");
+            Ok((
+                SrcDtype::F32,
+                raw.chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()) as f32)
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect(),
+            ))
+        }
+        P::U16 => {
+            eprintln!("note: tensor {name}: casting U16 to F32");
+            Ok((
+                SrcDtype::F32,
+                raw.chunks_exact(2)
+                    .map(|c| u16::from_le_bytes(c.try_into().unwrap()) as f32)
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect(),
+            ))
+        }
+        P::U8 => {
+            eprintln!("note: tensor {name}: casting U8 to F32");
+            Ok((
+                SrcDtype::F32,
+                f32_to_bytes(&raw.iter().map(|&b| b as f32).collect::<Vec<_>>()),
+            ))
+        }
+        P::Bool => {
+            eprintln!("note: tensor {name}: casting Bool to F32");
+            Ok((
+                SrcDtype::F32,
+                f32_to_bytes(
+                    &raw.iter()
+                        .map(|&b| (b != 0) as u8 as f32)
+                        .collect::<Vec<_>>(),
+                ),
+            ))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// NumPy
+// NumPy (manual .npy parser — no tensor library needed)
 // ---------------------------------------------------------------------------
 
+/// One parsed `.npy` array: row-major little-endian bytes plus dtype/shape.
+struct NpyArray {
+    kind: NpyDtype,
+    shape: Vec<u64>,
+    data: Vec<u8>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NpyDtype {
+    F32,
+    F16,
+    F64,
+    I64,
+    I32,
+    I16,
+    I8,
+    U64,
+    U32,
+    U16,
+    U8,
+    Bool,
+}
+
 fn load_npz(path: &Path) -> Result<Checkpoint> {
-    let npz = candle_core::npy::NpzTensors::new(path)
-        .with_context(|| format!("read npz {}", path.display()))?;
-    let mut names = npz
-        .names()
-        .into_iter()
-        .map(String::from)
-        .collect::<Vec<_>>();
+    let file = std::fs::File::open(path).with_context(|| format!("read npz {}", path.display()))?;
+    let mut zip = zip::ZipArchive::new(file).context("open npz zip")?;
+    let mut names: Vec<String> = (0..zip.len())
+        .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().to_string()))
+        .filter(|n| n.ends_with(".npy"))
+        .collect();
     names.sort();
+    anyhow::ensure!(
+        !names.is_empty(),
+        "npz {} holds no .npy entries",
+        path.display()
+    );
     let mut tensors = Vec::with_capacity(names.len());
     for name in &names {
-        let t = npz
-            .get(name)?
+        let mut f = zip
+            .by_name(name)
             .with_context(|| format!("npz entry {name} missing"))?;
-        tensors.push(tensor_to_raw(name, &t)?);
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut f, &mut bytes)?;
+        let arr = parse_npy(&bytes, name)?;
+        tensors.push(npy_to_raw(name.trim_end_matches(".npy"), arr)?);
     }
     Ok(Checkpoint {
         tensors,
@@ -350,31 +530,165 @@ fn load_npz(path: &Path) -> Result<Checkpoint> {
 }
 
 fn load_npy(path: &Path) -> Result<Checkpoint> {
-    let t = Tensor::read_npy(path).with_context(|| format!("read npy {}", path.display()))?;
+    let bytes = std::fs::read(path).with_context(|| format!("read npy {}", path.display()))?;
     let name = path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("tensor")
         .to_string();
+    let arr = parse_npy(&bytes, &name)?;
     Ok(Checkpoint {
-        tensors: vec![tensor_to_raw(&name, &t)?],
+        tensors: vec![npy_to_raw(&name, arr)?],
         metadata: Vec::new(),
     })
+}
+
+/// Parse a `.npy` v1/v2 buffer. Supports C-order little-endian numeric
+/// dtypes; Fortran-order arrays are rejected (convert with `np.ascontiguousarray`).
+fn parse_npy(bytes: &[u8], name: &str) -> Result<NpyArray> {
+    anyhow::ensure!(bytes.len() >= 10, "tensor {name}: file too short for .npy");
+    anyhow::ensure!(&bytes[..6] == b"\x93NUMPY", "tensor {name}: bad .npy magic");
+    let (header_len, header_off) = match bytes[6] {
+        1 => {
+            anyhow::ensure!(bytes.len() >= 10, "tensor {name}: truncated .npy header");
+            (u16::from_le_bytes([bytes[8], bytes[9]]) as usize, 10)
+        }
+        2 => {
+            anyhow::ensure!(bytes.len() >= 12, "tensor {name}: truncated .npy header");
+            (
+                u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize,
+                12,
+            )
+        }
+        v => anyhow::bail!("tensor {name}: unsupported .npy version {v}"),
+    };
+    anyhow::ensure!(
+        bytes.len() >= header_off + header_len,
+        "tensor {name}: truncated .npy header"
+    );
+    let header = std::str::from_utf8(&bytes[header_off..header_off + header_len])
+        .context(format!("tensor {name}: .npy header is not UTF-8"))?;
+    let descr = header
+        .split("'descr'")
+        .nth(1)
+        .and_then(|s| s.split('\'').nth(1))
+        .with_context(|| format!("tensor {name}: .npy header lacks 'descr'"))?;
+    let fortran = header.contains("'fortran_order': True");
+    anyhow::ensure!(!fortran, "tensor {name}: Fortran-order .npy not supported");
+    let shape: Vec<u64> = header
+        .split("'shape'")
+        .nth(1)
+        .and_then(|s| s.split(['(', ')']).nth(1))
+        .map(|s| {
+            s.split(',')
+                .filter_map(|n| n.trim().parse::<u64>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let (kind, elem) = match descr {
+        "<f4" => (NpyDtype::F32, 4),
+        "<f2" => (NpyDtype::F16, 2),
+        ">f4" | ">f2" => anyhow::bail!("tensor {name}: big-endian .npy not supported ({descr})"),
+        "<f8" => (NpyDtype::F64, 8),
+        "<i8" => (NpyDtype::I64, 8),
+        "<i4" => (NpyDtype::I32, 4),
+        "<i2" => (NpyDtype::I16, 2),
+        "<i1" | "|i1" => (NpyDtype::I8, 1),
+        "<u8" => (NpyDtype::U64, 8),
+        "<u4" => (NpyDtype::U32, 4),
+        "<u2" => (NpyDtype::U16, 2),
+        "|u1" => (NpyDtype::U8, 1),
+        "|b1" => (NpyDtype::Bool, 1),
+        _ => anyhow::bail!("tensor {name}: unsupported .npy dtype {descr}"),
+    };
+    // BF16 has no NumPy short code; the only 2-byte LE float here is F16.
+    let data = bytes[header_off + header_len..].to_vec();
+    let n_elems: usize = shape.iter().product::<u64>().max(1) as usize;
+    anyhow::ensure!(
+        data.len() == n_elems * elem,
+        "tensor {name}: .npy body is {} bytes, want {}",
+        data.len(),
+        n_elems * elem
+    );
+    Ok(NpyArray { kind, shape, data })
+}
+
+fn npy_to_raw(name: &str, arr: NpyArray) -> Result<RawTensor> {
+    let (dtype, data) = match arr.kind {
+        NpyDtype::F32 => (SrcDtype::F32, arr.data),
+        NpyDtype::F16 => (SrcDtype::F16, arr.data),
+        _ => {
+            eprintln!("note: tensor {name}: casting {:?} to F32", arr.kind);
+            (SrcDtype::F32, npy_cast_to_f32(&arr.data, arr.kind)?)
+        }
+    };
+    Ok(RawTensor {
+        name: name.to_string(),
+        shape: arr.shape,
+        dtype,
+        data,
+    })
+}
+
+/// Cast a non-F32/F16 `.npy` body to F32 LE bytes.
+fn npy_cast_to_f32(data: &[u8], kind: NpyDtype) -> Result<Vec<u8>> {
+    let vals: Vec<f32> = match kind {
+        NpyDtype::F32 | NpyDtype::F16 => {
+            anyhow::bail!("npy_cast_to_f32 called for passthrough dtype")
+        }
+        NpyDtype::F64 => data
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        NpyDtype::I64 => data
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        NpyDtype::I32 => data
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        NpyDtype::I16 => data
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        NpyDtype::I8 => data.iter().map(|&b| b as i8 as f32).collect(),
+        NpyDtype::U64 => data
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        NpyDtype::U32 => data
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        NpyDtype::U16 => data
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes(c.try_into().unwrap()) as f32)
+            .collect(),
+        NpyDtype::U8 => data.iter().map(|&b| b as f32).collect(),
+        NpyDtype::Bool => data.iter().map(|&b| (b != 0) as u8 as f32).collect(),
+    };
+    Ok(f32_to_bytes(&vals))
 }
 
 // ---------------------------------------------------------------------------
 // GGUF (enables re-quantization)
 // ---------------------------------------------------------------------------
 
-/// GGUF loading tries the in-crate minimal reader first (covers everything the
-/// zsfm writer emits, including BF16, which candle's reader rejects) and falls
-/// back to candle's reader for foreign quantization formats (Q4_K etc.).
+/// GGUF loading uses the in-crate minimal reader, which covers everything the
+/// zsfm writer emits (F32, F16, BF16, Q8_0). Foreign quantization formats
+/// (Q4_K and friends) are rejected with a pointer back to the source
+/// checkpoint — convert from safetensors/pickle instead of re-quantizing
+/// an already-quantized file.
 fn load_gguf(path: &Path) -> Result<Checkpoint> {
-    match load_gguf_minimal(path) {
-        Ok(ckpt) => Ok(ckpt),
-        Err(minimal_err) => load_gguf_candle(path)
-            .with_context(|| format!("minimal GGUF reader failed first with: {minimal_err:#}")),
-    }
+    load_gguf_minimal(path).with_context(|| {
+        format!(
+            "GGUF {} uses a quantization this reader does not support \
+             (supported: F32, F16, BF16, Q8_0) — convert from the source \
+             safetensors/pickle checkpoint instead",
+            path.display()
+        )
+    })
 }
 
 fn load_gguf_minimal(path: &Path) -> Result<Checkpoint> {
@@ -409,125 +723,27 @@ fn load_gguf_minimal(path: &Path) -> Result<Checkpoint> {
     })
 }
 
-fn load_gguf_candle(path: &Path) -> Result<Checkpoint> {
-    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut file = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-    let content = gguf_file::Content::read(&mut file).context("read GGUF header")?;
-    let device = Device::Cpu;
-
-    let mut names: Vec<String> = content.tensor_infos.keys().cloned().collect();
-    names.sort();
-
-    let mut tensors = Vec::with_capacity(names.len());
-    for name in &names {
-        let qt = content
-            .tensor(&mut file, name, &device)
-            .with_context(|| format!("read tensor {name}"))?;
-        let t = qt.dequantize(&device)?;
-        tensors.push(tensor_to_raw(name, &t)?);
-    }
-
-    let mut keys: Vec<&String> = content.metadata.keys().collect();
-    keys.sort();
-    let mut metadata = Vec::new();
-    for key in keys {
-        match gguf_value_to_meta(&content.metadata[key]) {
-            Some(v) => metadata.push((key.clone(), v)),
-            None => eprintln!("note: skipping GGUF metadata key {key} (unsupported value type)"),
-        }
-    }
-
-    Ok(Checkpoint { tensors, metadata })
-}
-
-fn gguf_value_to_meta(v: &gguf_file::Value) -> Option<GGUFMetaValue> {
-    use gguf_file::Value as V;
-    Some(match v {
-        V::U8(x) => GGUFMetaValue::Uint8(*x),
-        V::I8(x) => GGUFMetaValue::Int8(*x),
-        V::U16(x) => GGUFMetaValue::Uint16(*x),
-        V::I16(x) => GGUFMetaValue::Int16(*x),
-        V::U32(x) => GGUFMetaValue::Uint32(*x),
-        V::I32(x) => GGUFMetaValue::Int32(*x),
-        V::U64(x) => GGUFMetaValue::Uint64(*x),
-        V::I64(x) => GGUFMetaValue::Int64(*x),
-        V::F32(x) => GGUFMetaValue::Float32(*x),
-        V::F64(x) => GGUFMetaValue::Float64(*x),
-        V::Bool(x) => GGUFMetaValue::Bool(*x),
-        V::String(x) => GGUFMetaValue::String(x.clone()),
-        V::Array(items) => {
-            if items.iter().all(|i| matches!(i, V::U32(_))) {
-                GGUFMetaValue::ArrayUint32(items.iter().filter_map(|i| i.to_u32().ok()).collect())
-            } else if items.iter().all(|i| matches!(i, V::F32(_))) {
-                GGUFMetaValue::ArrayFloat32(items.iter().filter_map(|i| i.to_f32().ok()).collect())
-            } else if items.iter().all(|i| matches!(i, V::String(_))) {
-                GGUFMetaValue::ArrayString(
-                    items
-                        .iter()
-                        .filter_map(|i| i.to_string().ok().cloned())
-                        .collect(),
-                )
-            } else {
-                return None;
-            }
-        }
-    })
-}
-
-// ---------------------------------------------------------------------------
-// candle Tensor → RawTensor
-// ---------------------------------------------------------------------------
-
-fn tensor_to_raw(name: &str, t: &Tensor) -> Result<RawTensor> {
-    let shape: Vec<u64> = t.dims().iter().map(|&d| d as u64).collect();
-    let flat = t.flatten_all()?;
-    let (dtype, data) = match t.dtype() {
-        DType::F32 => (SrcDtype::F32, f32_to_bytes(&flat.to_vec1::<f32>()?)),
-        DType::F16 => {
-            let vals = flat.to_vec1::<half::f16>()?;
-            (
-                SrcDtype::F16,
-                vals.iter()
-                    .flat_map(|v| v.to_bits().to_le_bytes())
-                    .collect(),
-            )
-        }
-        DType::BF16 => {
-            let vals = flat.to_vec1::<half::bf16>()?;
-            (
-                SrcDtype::BF16,
-                vals.iter()
-                    .flat_map(|v| v.to_bits().to_le_bytes())
-                    .collect(),
-            )
-        }
-        other => {
-            eprintln!("note: tensor {name}: casting {other:?} to F32");
-            let vals = flat.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-            (SrcDtype::F32, f32_to_bytes(&vals))
-        }
-    };
-    Ok(RawTensor {
-        name: name.to_string(),
-        shape,
-        dtype,
-        data,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn write_test_safetensors(path: &Path) {
-        let dev = Device::Cpu;
-        let a = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), &dev).unwrap();
-        let b = Tensor::from_vec((0..32).map(|i| i as f32).collect::<Vec<_>>(), 32, &dev).unwrap();
-        candle_core::safetensors::save(
-            &std::collections::HashMap::from([("a".to_string(), a), ("b".to_string(), b)]),
-            path,
-        )
-        .unwrap();
+        // Minimal .safetensors writer: header JSON + raw LE bodies.
+        let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b: Vec<f32> = (0..32).map(|i| i as f32).collect();
+        let a_bytes: Vec<u8> = a.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let b_bytes: Vec<u8> = b.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let header = serde_json::json!({
+            "a": {"dtype": "F32", "shape": [2, 3], "data_offsets": [0, a_bytes.len()]},
+            "b": {"dtype": "F32", "shape": [32], "data_offsets": [a_bytes.len(), a_bytes.len() + b_bytes.len()]},
+        });
+        let header_str = header.to_string();
+        let mut file = vec![0u8; 8];
+        file[..8].copy_from_slice(&(header_str.len() as u64).to_le_bytes());
+        file.extend_from_slice(header_str.as_bytes());
+        file.extend_from_slice(&a_bytes);
+        file.extend_from_slice(&b_bytes);
+        std::fs::write(path, file).unwrap();
     }
 
     #[test]

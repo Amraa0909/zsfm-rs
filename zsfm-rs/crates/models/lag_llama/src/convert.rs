@@ -3,9 +3,9 @@ use std::io::BufWriter;
 use std::path::Path;
 
 use anyhow::Context;
-use candle_core::{pickle, DType, Device};
 use indicatif::{ProgressBar, ProgressStyle};
 
+use zsfm_checkpoint::cast::decode_to_f32;
 use zsfm_gguf::{GGMLType, GGUFMetaValue, GGUFWriter};
 
 use crate::config::LagLlamaConfig;
@@ -27,10 +27,16 @@ pub fn convert(
 
     println!("Reading checkpoint {} …", ckpt_path.display());
     // PyTorch Lightning checkpoints store model weights under the "state_dict" key.
-    let tensors = pickle::read_all_with_key(ckpt_path, Some("state_dict"))
-        .with_context(|| format!("read checkpoint {}", ckpt_path.display()))?;
+    let ckpt = zsfm_checkpoint::load_checkpoint(
+        &[ckpt_path.to_path_buf()],
+        &zsfm_checkpoint::LoadOptions {
+            pickle_key: Some("state_dict".to_string()),
+            ..Default::default()
+        },
+    )
+    .with_context(|| format!("read checkpoint {}", ckpt_path.display()))?;
 
-    let total = tensors.len();
+    let total = ckpt.tensors.len();
     let pb = ProgressBar::new(total as u64);
     pb.set_style(
         ProgressStyle::with_template(
@@ -40,15 +46,15 @@ pub fn convert(
         .progress_chars("=>-"),
     );
 
-    let device = Device::Cpu;
     let mut mapped = 0usize;
     let mut skipped: Vec<String> = Vec::new();
     let mut fallback_count = 0usize;
 
-    for (hf_name, tensor) in &tensors {
+    for raw in &ckpt.tensors {
+        let hf_name = raw.name.clone();
         pb.set_message(hf_name.clone());
 
-        let gguf_name = match map_tensor_name(hf_name) {
+        let gguf_name = match map_tensor_name(&hf_name) {
             Some(n) => n,
             None => {
                 skipped.push(hf_name.clone());
@@ -57,17 +63,14 @@ pub fn convert(
             }
         };
 
-        // Shape from candle is in Python order (e.g. [out, in]).
-        let py_shape: Vec<usize> = tensor.shape().dims().to_vec();
+        // Shape is in Python order (e.g. [out, in]).
+        let py_shape: Vec<usize> = raw.shape.iter().map(|&d| d as usize).collect();
         let n_elems: usize = py_shape.iter().product();
         let innermost = py_shape.last().copied().unwrap_or(1);
 
-        // Decode to f32 using candle — handles BF16/F16/F32 transparently.
-        let f32_vals: Vec<f32> = tensor
-            .to_device(&device)?
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1()?;
+        // Decode to f32 — handles BF16/F16/F32 transparently.
+        let f32_vals: Vec<f32> = decode_to_f32(&raw.data, raw.dtype)
+            .with_context(|| format!("tensor {hf_name}: decode failed"))?;
 
         let (dst_dtype, gguf_shape, tensor_data) =
             if opts.output_dtype == GGMLType::Q8_0 && (innermost % 32 != 0 || n_elems % 32 != 0) {

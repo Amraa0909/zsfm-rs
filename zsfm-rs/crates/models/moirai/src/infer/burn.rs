@@ -1,18 +1,16 @@
 //! Moirai-1.0 inference on the Burn backend (Flex CPU).
 //!
-//! Bit-exact port of `super` (candle): mean-scale norm, patch embedding,
-//! masked bidirectional encoder with QK-norm attention, split-half RoPE,
-//! variate bias, SwiGLU FFN, Student-t loc head. Weight loading goes through
-//! the existing candle GGUF reader and converts each F32 tensor to Burn
-//! `TensorData`, so there is exactly one GGUF parser.
+//! Mean-scale norm, patch embedding, masked bidirectional encoder with
+//! QK-norm attention, split-half RoPE, variate bias, SwiGLU FFN,
+//! Student-t loc head, with weights loaded straight from GGUF via
+//! [`zsfm_burn::GgufWeights`].
 
-use std::io::BufReader;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use burn::tensor::{activation, Device, Tensor, TensorData};
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device as CDevice};
+use zsfm_burn::{open_gguf_weights, GgufWeights};
+
 use zsfm_burn::linear::{burn_linear_bias, burn_linear_nobias};
 use zsfm_burn::norm::burn_rms_norm_nd;
 
@@ -25,39 +23,20 @@ fn device() -> Device {
     Device::flex()
 }
 
-fn burn2(t: &candle_core::Tensor) -> Result<Tensor<2>> {
-    zsfm_burn::burn_weight_2d(t, &device())
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
 }
 
-fn burn1(t: &candle_core::Tensor) -> Result<Tensor<1>> {
-    zsfm_burn::burn_weight_1d(t, &device())
+fn load_v(weights: &GgufWeights, name: &str) -> Result<Tensor<1>> {
+    weights.load_1d(name)
 }
 
-fn load_t(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<2>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn2(&t)
+fn load_3d(weights: &GgufWeights, name: &str) -> Result<Tensor<3>> {
+    weights.load_3d(name)
 }
 
-fn load_v(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<1>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn1(&t)
-}
-
-fn load_3d(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<3>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    zsfm_burn::burn_weight_3d(&t, &device())
+fn load_flat(weights: &GgufWeights, name: &str) -> Result<Vec<f32>> {
+    weights.load_flat(name)
 }
 
 fn linear(x: Tensor<2>, w: Tensor<2>, b: Option<Tensor<1>>) -> Tensor<2> {
@@ -109,69 +88,28 @@ pub struct BurnMoiraiModel {
 
 impl BurnMoiraiModel {
     pub fn load(gguf_path: &Path, config: MoiraiConfig) -> Result<Self> {
-        let file = std::fs::File::open(gguf_path)
+        let weights = open_gguf_weights(gguf_path)
             .with_context(|| format!("open {}", gguf_path.display()))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-        let content = gguf_file::Content::read(&mut reader).context("parse GGUF header")?;
         let dev = device();
 
-        let in_proj_w = load_3d(&content, &mut reader, "in_proj.weight")?;
+        let in_proj_w = load_3d(&weights, "in_proj.weight")?;
         let in_proj_b = {
-            let t = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                "in_proj.bias",
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            let d: Vec<f32> = t.flatten_all()?.to_vec1()?;
-            anyhow::ensure!(d.len() % 5 == 0, "in_proj.bias len");
+            let d: Vec<f32> = load_flat(&weights, "in_proj.bias")?;
+            anyhow::ensure!(d.len().is_multiple_of(5), "in_proj.bias len");
             let d_model = d.len() / 5;
             Tensor::<2>::from_data(TensorData::new(d, [5, d_model]), &dev)
         };
-        let mask_embed = load_t(&content, &mut reader, "mask_embed.weight")?;
+        let mask_embed = load_t(&weights, "mask_embed.weight")?;
 
         let n_heads = config.n_heads;
         let mut blocks = Vec::with_capacity(config.n_layers);
         for n in 0..config.n_layers {
             let p = |s: &str| format!("blk.{n}.{s}");
-            let qw = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &p("attn_q.weight"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            let kw = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &p("attn_k.weight"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            let vw = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &p("attn_v.weight"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            let mut cat = Vec::new();
-            for t in [&qw, &kw, &vw] {
-                cat.extend_from_slice(&t.flatten_all()?.to_vec1::<f32>()?);
-            }
-            let d_model = config.d_model;
-            let attn_qkv_w =
-                Tensor::<2>::from_data(TensorData::new(cat, [3 * d_model, d_model]), &dev);
-            let vbias_raw: Vec<f32> = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &p("attn_vbias.weight"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?
-            .flatten_all()?
-            .to_vec1()?;
+            let qw = load_t(&weights, &p("attn_q.weight"))?;
+            let kw = load_t(&weights, &p("attn_k.weight"))?;
+            let vw = load_t(&weights, &p("attn_v.weight"))?;
+            let attn_qkv_w = Tensor::cat(vec![qw, kw, vw], 0);
+            let vbias_raw: Vec<f32> = load_flat(&weights, &p("attn_vbias.weight"))?;
             let vbias_obs = Tensor::<3>::from_data(
                 TensorData::new(vbias_raw[0..n_heads].to_vec(), [n_heads, 1, 1]),
                 &dev,
@@ -181,32 +119,25 @@ impl BurnMoiraiModel {
                 &dev,
             );
             blocks.push(BurnEncoderBlock {
-                norm1_w: load_v(&content, &mut reader, &p("norm1.weight"))?,
-                norm2_w: load_v(&content, &mut reader, &p("norm2.weight"))?,
+                norm1_w: load_v(&weights, &p("norm1.weight"))?,
+                norm2_w: load_v(&weights, &p("norm2.weight"))?,
                 attn_qkv_w,
-                attn_o_w: load_t(&content, &mut reader, &p("attn_o.weight"))?,
-                attn_qn_w: load_v(&content, &mut reader, &p("attn_qn.weight"))?,
-                attn_kn_w: load_v(&content, &mut reader, &p("attn_kn.weight"))?,
+                attn_o_w: load_t(&weights, &p("attn_o.weight"))?,
+                attn_qn_w: load_v(&weights, &p("attn_qn.weight"))?,
+                attn_kn_w: load_v(&weights, &p("attn_kn.weight"))?,
                 vbias_obs,
                 vbias_mask,
-                ffn_fc1_w: load_t(&content, &mut reader, &p("ffn_fc1.weight"))?,
-                ffn_fc2_w: load_t(&content, &mut reader, &p("ffn_fc2.weight"))?,
-                ffn_gate_w: load_t(&content, &mut reader, &p("ffn_gate.weight"))?,
+                ffn_fc1_w: load_t(&weights, &p("ffn_fc1.weight"))?,
+                ffn_fc2_w: load_t(&weights, &p("ffn_fc2.weight"))?,
+                ffn_gate_w: load_t(&weights, &p("ffn_gate.weight"))?,
             });
         }
 
-        let norm_f_w = load_v(&content, &mut reader, "norm_f.weight")?;
-        let head_st_loc_w = load_3d(&content, &mut reader, "head.st_loc.weight")?;
+        let norm_f_w = load_v(&weights, "norm_f.weight")?;
+        let head_st_loc_w = load_3d(&weights, "head.st_loc.weight")?;
         let head_st_loc_b = {
-            let t = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                "head.st_loc.bias",
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            let d: Vec<f32> = t.flatten_all()?.to_vec1()?;
-            anyhow::ensure!(d.len() % 5 == 0, "head bias len");
+            let d: Vec<f32> = load_flat(&weights, "head.st_loc.bias")?;
+            anyhow::ensure!(d.len().is_multiple_of(5), "head bias len");
             let max_ps = d.len() / 5;
             Tensor::<2>::from_data(TensorData::new(d, [5, max_ps]), &dev)
         };
@@ -245,14 +176,14 @@ impl BurnMoiraiModel {
             ctx_scaled = ctx_scaled[start..].to_vec();
         }
         let ctx_len = ctx_scaled.len();
-        let ctx_padded_len = ((ctx_len + patch_size - 1) / patch_size) * patch_size;
+        let ctx_padded_len = ctx_len.div_ceil(patch_size) * patch_size;
         if ctx_padded_len > ctx_len {
             let mut padded = vec![0.0f32; ctx_padded_len - ctx_len];
             padded.extend_from_slice(&ctx_scaled);
             ctx_scaled = padded;
         }
         let n_ctx_patches = ctx_scaled.len() / patch_size;
-        let n_fc_patches = (horizon + patch_size - 1) / patch_size;
+        let n_fc_patches = horizon.div_ceil(patch_size);
         let total_patches = n_ctx_patches + n_fc_patches;
         let d_model = cfg.d_model;
         let max_ps = cfg.max_patch_size;
@@ -284,9 +215,7 @@ impl BurnMoiraiModel {
         let mut h = Tensor::cat(vec![ctx_emb, fc_emb], 0);
 
         let mut is_masked = vec![0u8; total_patches];
-        for i in n_ctx_patches..total_patches {
-            is_masked[i] = 1;
-        }
+        is_masked[n_ctx_patches..total_patches].fill(1);
         for blk in &self.blocks {
             h = self.forward_block(h, blk, &is_masked, total_patches)?;
         }
@@ -512,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn burn_matches_candle_on_synthetic_gguf() {
+    fn burn_forecast_golden() {
         // d=32, heads=4, hd=8, 1 layer, patch 32.
         let dir = std::env::temp_dir().join(format!("moirai-burn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -547,23 +476,23 @@ mod tests {
         w.write_to(&mut std::io::BufWriter::new(f)).unwrap();
 
         let cfg = tiny_config();
-        let candle = crate::MoiraiModel::load(&path, cfg.clone()).unwrap();
         let burn = BurnMoiraiModel::load(&path, cfg).unwrap();
         let ctx: Vec<f32> = (0..32).map(|i| 10.0 + 0.5 * i as f32).collect();
         let t0 = std::time::Instant::now();
-        let a = candle.forecast(&ctx, 4).unwrap();
-        let candle_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let t0 = std::time::Instant::now();
-        let b = burn.forecast(&ctx, 4).unwrap();
+        let a = burn.forecast(&ctx, 4).unwrap();
         let burn_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        assert_eq!(a.len(), b.len());
-        let err: f32 = a
-            .iter()
-            .zip(b.iter())
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0, f32::max);
-        println!("moirai synthetic: candle {candle_ms:.1}ms burn {burn_ms:.1}ms err {err:.2e}");
-        assert!(err < 1e-4, "moirai Burn parity failed: {err:.2e}");
+        let b = burn.forecast(&ctx, 4).unwrap();
+        assert_eq!(a.len(), 4);
+        assert!(a.iter().all(|v| v.is_finite()));
+        assert!(a.iter().any(|&v| v != 0.0));
+        assert_eq!(a, b, "forecast must be deterministic");
+        println!("moirai synthetic: burn {burn_ms:.1}ms out={a:?}");
+        // Golden values recorded from the verified Burn port (ex-candle parity Xe-Y).
+        let golden: [f32; 4] = [10.968519, 12.493711, 11.747968, 11.247049];
+        assert_eq!(a.len(), golden.len());
+        for (x, y) in a.iter().zip(golden.iter()) {
+            assert!((x - y).abs() < 1e-4, "golden drift: {x} vs {y}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

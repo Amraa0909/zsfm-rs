@@ -1,21 +1,17 @@
 //! TabICL v2 inference on the Burn backend (Flex CPU).
 //!
-//! Bit-exact port of `super` (candle): column Set-Transformer embedding,
-//! row interaction with RoPE, in-context transformer with SSMax, decoder
-//! head. Weight loading goes through the existing candle GGUF reader and
-//! converts each F32 tensor to Burn `TensorData`, so there is exactly one
-//! GGUF parser.
+//! Column Set-Transformer embedding, row interaction with RoPE, in-context
+//! transformer with SSMax, decoder head, with weights loaded straight from
+//! GGUF via [`zsfm_burn::GgufWeights`].
 
-use std::io::BufReader;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use burn::tensor::{activation, Device, Tensor, TensorData};
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device as CDevice};
 use zsfm_burn::linear::burn_linear_nd;
 use zsfm_burn::norm::burn_layer_norm_nd;
 use zsfm_burn::rope::apply_llama_rope;
+use zsfm_burn::{open_gguf_weights, GgufWeights};
 
 use crate::config::TabIclConfig;
 
@@ -25,30 +21,12 @@ fn device() -> Device {
     Device::flex()
 }
 
-fn burn2(t: &candle_core::Tensor) -> Result<Tensor<2>> {
-    zsfm_burn::burn_weight_2d(t, &device())
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
 }
 
-fn burn1(t: &candle_core::Tensor) -> Result<Tensor<1>> {
-    zsfm_burn::burn_weight_1d(t, &device())
-}
-
-fn load_t(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<2>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn2(&t)
-}
-
-fn load_v(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<1>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn1(&t)
+fn load_v(weights: &GgufWeights, name: &str) -> Result<Tensor<1>> {
+    weights.load_1d(name)
 }
 
 fn linear<const D: usize>(x: Tensor<D>, w: Tensor<2>, b: Option<Tensor<1>>) -> Tensor<D> {
@@ -149,116 +127,63 @@ pub struct BurnTabIclModel {
     icl: BurnIclW,
 }
 
-fn load_ssmax(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    prefix: &str,
-) -> Result<BurnSsmaxW> {
+fn load_ssmax(weights: &GgufWeights, prefix: &str) -> Result<BurnSsmaxW> {
     Ok(BurnSsmaxW {
-        base_fc1_w: load_t(
-            content,
-            reader,
-            &format!("{prefix}.ssmax_layer.base_mlp.0.weight"),
-        )?,
-        base_fc1_b: load_v(
-            content,
-            reader,
-            &format!("{prefix}.ssmax_layer.base_mlp.0.bias"),
-        )?,
-        base_fc2_w: load_t(
-            content,
-            reader,
-            &format!("{prefix}.ssmax_layer.base_mlp.2.weight"),
-        )?,
-        base_fc2_b: load_v(
-            content,
-            reader,
-            &format!("{prefix}.ssmax_layer.base_mlp.2.bias"),
-        )?,
-        query_fc1_w: load_t(
-            content,
-            reader,
-            &format!("{prefix}.ssmax_layer.query_mlp.0.weight"),
-        )?,
-        query_fc1_b: load_v(
-            content,
-            reader,
-            &format!("{prefix}.ssmax_layer.query_mlp.0.bias"),
-        )?,
-        query_fc2_w: load_t(
-            content,
-            reader,
-            &format!("{prefix}.ssmax_layer.query_mlp.2.weight"),
-        )?,
-        query_fc2_b: load_v(
-            content,
-            reader,
-            &format!("{prefix}.ssmax_layer.query_mlp.2.bias"),
-        )?,
+        base_fc1_w: load_t(weights, &format!("{prefix}.ssmax_layer.base_mlp.0.weight"))?,
+        base_fc1_b: load_v(weights, &format!("{prefix}.ssmax_layer.base_mlp.0.bias"))?,
+        base_fc2_w: load_t(weights, &format!("{prefix}.ssmax_layer.base_mlp.2.weight"))?,
+        base_fc2_b: load_v(weights, &format!("{prefix}.ssmax_layer.base_mlp.2.bias"))?,
+        query_fc1_w: load_t(weights, &format!("{prefix}.ssmax_layer.query_mlp.0.weight"))?,
+        query_fc1_b: load_v(weights, &format!("{prefix}.ssmax_layer.query_mlp.0.bias"))?,
+        query_fc2_w: load_t(weights, &format!("{prefix}.ssmax_layer.query_mlp.2.weight"))?,
+        query_fc2_b: load_v(weights, &format!("{prefix}.ssmax_layer.query_mlp.2.bias"))?,
     })
 }
 
-fn load_attn(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    prefix: &str,
-    has_ssmax: bool,
-) -> Result<BurnAttnW> {
+fn load_attn(weights: &GgufWeights, prefix: &str, has_ssmax: bool) -> Result<BurnAttnW> {
     Ok(BurnAttnW {
-        in_proj_w: load_t(content, reader, &format!("{prefix}.in_proj_weight"))?,
-        in_proj_b: load_v(content, reader, &format!("{prefix}.in_proj_bias"))?,
-        out_proj_w: load_t(content, reader, &format!("{prefix}.out_proj.weight"))?,
-        out_proj_b: load_v(content, reader, &format!("{prefix}.out_proj.bias"))?,
+        in_proj_w: load_t(weights, &format!("{prefix}.in_proj_weight"))?,
+        in_proj_b: load_v(weights, &format!("{prefix}.in_proj_bias"))?,
+        out_proj_w: load_t(weights, &format!("{prefix}.out_proj.weight"))?,
+        out_proj_b: load_v(weights, &format!("{prefix}.out_proj.bias"))?,
         ssmax: if has_ssmax {
-            Some(load_ssmax(content, reader, prefix)?)
+            Some(load_ssmax(weights, prefix)?)
         } else {
             None
         },
     })
 }
 
-fn load_block(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    prefix: &str,
-    has_ssmax: bool,
-) -> Result<BurnBlockW> {
+fn load_block(weights: &GgufWeights, prefix: &str, has_ssmax: bool) -> Result<BurnBlockW> {
     Ok(BurnBlockW {
-        norm1_w: load_v(content, reader, &format!("{prefix}.norm1.weight"))?,
-        norm1_b: load_v(content, reader, &format!("{prefix}.norm1.bias"))?,
-        norm2_w: load_v(content, reader, &format!("{prefix}.norm2.weight"))?,
-        norm2_b: load_v(content, reader, &format!("{prefix}.norm2.bias"))?,
-        attn: load_attn(content, reader, &format!("{prefix}.attn"), has_ssmax)?,
-        fc1_w: load_t(content, reader, &format!("{prefix}.linear1.weight"))?,
-        fc1_b: load_v(content, reader, &format!("{prefix}.linear1.bias"))?,
-        fc2_w: load_t(content, reader, &format!("{prefix}.linear2.weight"))?,
-        fc2_b: load_v(content, reader, &format!("{prefix}.linear2.bias"))?,
+        norm1_w: load_v(weights, &format!("{prefix}.norm1.weight"))?,
+        norm1_b: load_v(weights, &format!("{prefix}.norm1.bias"))?,
+        norm2_w: load_v(weights, &format!("{prefix}.norm2.weight"))?,
+        norm2_b: load_v(weights, &format!("{prefix}.norm2.bias"))?,
+        attn: load_attn(weights, &format!("{prefix}.attn"), has_ssmax)?,
+        fc1_w: load_t(weights, &format!("{prefix}.linear1.weight"))?,
+        fc1_b: load_v(weights, &format!("{prefix}.linear1.bias"))?,
+        fc2_w: load_t(weights, &format!("{prefix}.linear2.weight"))?,
+        fc2_b: load_v(weights, &format!("{prefix}.linear2.bias"))?,
     })
 }
 
 impl BurnTabIclModel {
     pub fn load(gguf_path: &Path, config: TabIclConfig) -> Result<Self> {
-        let file = std::fs::File::open(gguf_path)
+        let weights = open_gguf_weights(gguf_path)
             .with_context(|| format!("open {}", gguf_path.display()))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-        let content = gguf_file::Content::read(&mut reader).context("parse GGUF header")?;
 
-        let col_in_linear_w = load_t(&content, &mut reader, "col_embedder.in_linear.weight")?;
-        let col_in_linear_b = load_v(&content, &mut reader, "col_embedder.in_linear.bias")?;
-        let col_y_w = load_t(&content, &mut reader, "col_embedder.y_encoder.weight")?;
-        let col_y_b = load_v(&content, &mut reader, "col_embedder.y_encoder.bias")?;
+        let col_in_linear_w = load_t(&weights, "col_embedder.in_linear.weight")?;
+        let col_in_linear_b = load_v(&weights, "col_embedder.in_linear.bias")?;
+        let col_y_w = load_t(&weights, "col_embedder.y_encoder.weight")?;
+        let col_y_b = load_v(&weights, "col_embedder.y_encoder.bias")?;
 
         let mut col_blocks = Vec::with_capacity(config.col_num_blocks);
         for n in 0..config.col_num_blocks {
             let p = format!("col_embedder.tf_col.blocks.{n}");
-            let ind_vectors = load_t(&content, &mut reader, &format!("{p}.ind_vectors"))?;
-            let attn1 = load_block(&content, &mut reader, &format!("{p}.multihead_attn1"), true)?;
-            let attn2 = load_block(
-                &content,
-                &mut reader,
-                &format!("{p}.multihead_attn2"),
-                false,
-            )?;
+            let ind_vectors = load_t(&weights, &format!("{p}.ind_vectors"))?;
+            let attn1 = load_block(&weights, &format!("{p}.multihead_attn1"), true)?;
+            let attn2 = load_block(&weights, &format!("{p}.multihead_attn2"), false)?;
             col_blocks.push(BurnIsabW {
                 ind_vectors,
                 attn1,
@@ -266,23 +191,14 @@ impl BurnTabIclModel {
             });
         }
 
-        let cls_tokens = load_t(&content, &mut reader, "row_interactor.cls_tokens")?;
-        let row_out_ln_w = load_v(&content, &mut reader, "row_interactor.out_ln.weight")?;
-        let row_out_ln_b = load_v(&content, &mut reader, "row_interactor.out_ln.bias")?;
-        let rope_freqs: Vec<f32> = zsfm_nn::load_tensor(
-            &content,
-            &mut reader,
-            "row_interactor.tf_row.rope.freqs",
-            &CDevice::Cpu,
-            DType::F32,
-        )?
-        .flatten_all()?
-        .to_vec1()?;
+        let cls_tokens = load_t(&weights, "row_interactor.cls_tokens")?;
+        let row_out_ln_w = load_v(&weights, "row_interactor.out_ln.weight")?;
+        let row_out_ln_b = load_v(&weights, "row_interactor.out_ln.bias")?;
+        let rope_freqs: Vec<f32> = weights.load_flat("row_interactor.tf_row.rope.freqs")?;
         let mut row_blocks = Vec::with_capacity(config.row_num_blocks);
         for n in 0..config.row_num_blocks {
             row_blocks.push(load_block(
-                &content,
-                &mut reader,
+                &weights,
                 &format!("row_interactor.tf_row.blocks.{n}"),
                 false,
             )?);
@@ -291,8 +207,7 @@ impl BurnTabIclModel {
         let mut icl_blocks = Vec::with_capacity(config.icl_num_blocks);
         for n in 0..config.icl_num_blocks {
             icl_blocks.push(load_block(
-                &content,
-                &mut reader,
+                &weights,
                 &format!("icl_predictor.tf_icl.blocks.{n}"),
                 true,
             )?);
@@ -315,15 +230,15 @@ impl BurnTabIclModel {
                 rope_freqs,
             },
             icl: BurnIclW {
-                y_encoder_w: load_t(&content, &mut reader, "icl_predictor.y_encoder.weight")?,
-                y_encoder_b: load_v(&content, &mut reader, "icl_predictor.y_encoder.bias")?,
+                y_encoder_w: load_t(&weights, "icl_predictor.y_encoder.weight")?,
+                y_encoder_b: load_v(&weights, "icl_predictor.y_encoder.bias")?,
                 blocks: icl_blocks,
-                ln_w: load_v(&content, &mut reader, "icl_predictor.ln.weight")?,
-                ln_b: load_v(&content, &mut reader, "icl_predictor.ln.bias")?,
-                decoder_fc1_w: load_t(&content, &mut reader, "icl_predictor.decoder.0.weight")?,
-                decoder_fc1_b: load_v(&content, &mut reader, "icl_predictor.decoder.0.bias")?,
-                decoder_fc2_w: load_t(&content, &mut reader, "icl_predictor.decoder.2.weight")?,
-                decoder_fc2_b: load_v(&content, &mut reader, "icl_predictor.decoder.2.bias")?,
+                ln_w: load_v(&weights, "icl_predictor.ln.weight")?,
+                ln_b: load_v(&weights, "icl_predictor.ln.bias")?,
+                decoder_fc1_w: load_t(&weights, "icl_predictor.decoder.0.weight")?,
+                decoder_fc1_b: load_v(&weights, "icl_predictor.decoder.0.bias")?,
+                decoder_fc2_w: load_t(&weights, "icl_predictor.decoder.2.weight")?,
+                decoder_fc2_b: load_v(&weights, "icl_predictor.decoder.2.bias")?,
             },
         })
     }
@@ -902,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn burn_matches_candle_classification() {
+    fn burn_classification_golden() {
         let dir = std::env::temp_dir().join(format!("tabicl-burn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -988,7 +903,6 @@ mod tests {
         w.write_to(&mut std::io::BufWriter::new(f)).unwrap();
 
         let cfg = tiny_config();
-        let candle = crate::TabIclModel::load(&path, cfg.clone()).unwrap();
         let burn = BurnTabIclModel::load(&path, cfg).unwrap();
         let x_support = vec![
             vec![0.1, 1.2],
@@ -999,23 +913,26 @@ mod tests {
         let y_support = vec![0usize, 1, 1, 0];
         let x_query = vec![vec![0.2, 0.9], vec![-0.8, 0.1]];
         let t0 = std::time::Instant::now();
-        let a = candle
-            .predict_classification(&x_support, &y_support, &x_query, 2)
-            .unwrap();
-        let candle_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let t0 = std::time::Instant::now();
-        let b = burn
+        let a = burn
             .predict_classification(&x_support, &y_support, &x_query, 2)
             .unwrap();
         let burn_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let mut err = 0.0f32;
-        for (ra, rb) in a.iter().zip(b.iter()) {
-            for (x, y) in ra.iter().zip(rb.iter()) {
-                err = err.max((x - y).abs());
+        let b = burn
+            .predict_classification(&x_support, &y_support, &x_query, 2)
+            .unwrap();
+        assert_eq!(a.len(), 2);
+        assert!(a
+            .iter()
+            .all(|r| r.len() == 2 && r.iter().all(|v| v.is_finite())));
+        assert_eq!(a, b, "predict must be deterministic");
+        println!("tabicl synthetic: burn {burn_ms:.1}ms out={a:?}");
+        // Golden recorded from the verified Burn port (ex-candle parity 3.0e-8).
+        let golden = [[0.6072121, 0.39278784], [0.60720557, 0.39279446]];
+        for (ra, re) in a.iter().zip(golden.iter()) {
+            for (x, y) in ra.iter().zip(re.iter()) {
+                assert!((x - y).abs() < 1e-4, "golden drift: {x} vs {y}");
             }
         }
-        println!("tabicl synthetic: candle {candle_ms:.1}ms burn {burn_ms:.1}ms err {err:.2e}");
-        assert!(err < 1e-4, "tabicl Burn parity failed: {err:.2e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

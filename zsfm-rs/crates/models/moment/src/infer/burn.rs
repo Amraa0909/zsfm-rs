@@ -1,18 +1,14 @@
 //! MOMENT-1-large inference on the Burn backend (Flex CPU).
 //!
-//! Bit-exact port of `super` (candle): RevIN, patch embedding with mask
-//! tokens, T5 relative-bias encoder blocks, gated-GELU FFN, reconstruction
-//! head. Weight loading goes through the existing candle GGUF reader and
-//! converts each F32 tensor to Burn `TensorData`, so there is exactly one
-//! GGUF parser.
+//! RevIN, patch embedding with mask tokens, T5 relative-bias encoder
+//! blocks, gated-GELU FFN, reconstruction head, with weights loaded
+//! straight from GGUF via [`zsfm_burn::GgufWeights`].
 
-use std::io::BufReader;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use burn::tensor::{activation, Device, Tensor, TensorData};
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device as CDevice};
+use zsfm_burn::{open_gguf_weights, GgufWeights};
 
 use crate::config::MomentConfig;
 
@@ -20,30 +16,16 @@ fn device() -> Device {
     Device::flex()
 }
 
-fn burn2(t: &candle_core::Tensor) -> Result<Tensor<2>> {
-    zsfm_burn::burn_weight_2d(t, &device())
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
 }
 
-fn burn1(t: &candle_core::Tensor) -> Result<Tensor<1>> {
-    zsfm_burn::burn_weight_1d(t, &device())
+fn load_v(weights: &GgufWeights, name: &str) -> Result<Tensor<1>> {
+    weights.load_1d(name)
 }
 
-fn load_t(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<2>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn2(&t)
-}
-
-fn load_v(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<1>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn1(&t)
+fn load_flat(weights: &GgufWeights, name: &str) -> Result<Vec<f32>> {
+    weights.load_flat(name)
 }
 
 fn linear(x: Tensor<2>, w: Tensor<2>, b: Option<Tensor<1>>) -> Tensor<2> {
@@ -81,85 +63,35 @@ pub struct BurnMomentModel {
 
 impl BurnMomentModel {
     pub fn load(gguf_path: &Path, config: MomentConfig) -> Result<Self> {
-        let file = std::fs::File::open(gguf_path)
+        let weights = open_gguf_weights(gguf_path)
             .with_context(|| format!("open {}", gguf_path.display()))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-        let content = gguf_file::Content::read(&mut reader).context("parse GGUF header")?;
 
-        let patch_embed_w = load_t(&content, &mut reader, "patch_embed.weight")?;
-        let pos_t = zsfm_nn::load_tensor(
-            &content,
-            &mut reader,
-            "pos_embed.pe",
-            &CDevice::Cpu,
-            DType::F32,
-        )?;
-        let pos_dims = pos_t.dims().to_vec();
-        anyhow::ensure!(pos_dims.len() == 3, "pos_embed must be 3D");
-        let pos_data: Vec<f32> = pos_t.flatten_all()?.to_vec1()?;
-        let pos_embed = Tensor::<3>::from_data(
-            TensorData::new(pos_data, [pos_dims[0], pos_dims[1], pos_dims[2]]),
-            &device(),
-        );
-        let mask_embed = load_v(&content, &mut reader, "mask_embed")?;
-        let rel_bias_data: Vec<f32> = zsfm_nn::load_tensor(
-            &content,
-            &mut reader,
-            "blk.0.attn_rel_bias.weight",
-            &CDevice::Cpu,
-            DType::F32,
-        )?
-        .flatten_all()?
-        .to_vec1()?;
+        let patch_embed_w = load_t(&weights, "patch_embed.weight")?;
+        let pos_embed: Tensor<3> = weights.load_3d("pos_embed.pe")?;
+        let mask_embed = load_v(&weights, "mask_embed")?;
+        let rel_bias_data: Vec<f32> = load_flat(&weights, "blk.0.attn_rel_bias.weight")?;
 
         let mut blocks = Vec::with_capacity(config.n_layers);
         for n in 0..config.n_layers {
             let p = |s: &str| format!("blk.{n}.{s}");
-            let qw = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &p("attn_q.weight"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            let kw = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &p("attn_k.weight"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            let vw = zsfm_nn::load_tensor(
-                &content,
-                &mut reader,
-                &p("attn_v.weight"),
-                &CDevice::Cpu,
-                DType::F32,
-            )?;
-            let qd: Vec<f32> = qw.flatten_all()?.to_vec1()?;
-            let kd: Vec<f32> = kw.flatten_all()?.to_vec1()?;
-            let vd: Vec<f32> = vw.flatten_all()?.to_vec1()?;
-            let d = config.d_model;
-            let mut cat = Vec::with_capacity(3 * d * d);
-            cat.extend_from_slice(&qd);
-            cat.extend_from_slice(&kd);
-            cat.extend_from_slice(&vd);
-            let dev = device();
-            let attn_qkv_w = Tensor::<2>::from_data(TensorData::new(cat, [3 * d, d]), &dev);
+            let qw = load_t(&weights, &p("attn_q.weight"))?;
+            let kw = load_t(&weights, &p("attn_k.weight"))?;
+            let vw = load_t(&weights, &p("attn_v.weight"))?;
+            let attn_qkv_w = Tensor::cat(vec![qw, kw, vw], 0);
             blocks.push(BurnEncoderBlock {
                 attn_qkv_w,
-                attn_o_w: load_t(&content, &mut reader, &p("attn_o.weight"))?,
-                attn_norm_w: load_v(&content, &mut reader, &p("attn_norm.weight"))?,
-                ffn_wi0_w: load_t(&content, &mut reader, &p("ffn_wi0.weight"))?,
-                ffn_wi1_w: load_t(&content, &mut reader, &p("ffn_wi1.weight"))?,
-                ffn_wo_w: load_t(&content, &mut reader, &p("ffn_wo.weight"))?,
-                ffn_norm_w: load_v(&content, &mut reader, &p("ffn_norm.weight"))?,
+                attn_o_w: load_t(&weights, &p("attn_o.weight"))?,
+                attn_norm_w: load_v(&weights, &p("attn_norm.weight"))?,
+                ffn_wi0_w: load_t(&weights, &p("ffn_wi0.weight"))?,
+                ffn_wi1_w: load_t(&weights, &p("ffn_wi1.weight"))?,
+                ffn_wo_w: load_t(&weights, &p("ffn_wo.weight"))?,
+                ffn_norm_w: load_v(&weights, &p("ffn_norm.weight"))?,
             });
         }
 
-        let norm_f_w = load_v(&content, &mut reader, "norm_f.weight")?;
-        let head_w = load_t(&content, &mut reader, "head.weight")?;
-        let head_b = load_v(&content, &mut reader, "head.bias")?;
+        let norm_f_w = load_v(&weights, "norm_f.weight")?;
+        let head_w = load_t(&weights, "head.weight")?;
+        let head_b = load_v(&weights, "head.bias")?;
 
         Ok(Self {
             config,
@@ -190,7 +122,7 @@ impl BurnMomentModel {
         }
 
         let ctx_patches = cfg.seq_len / cfg.patch_stride;
-        let n_fc = (horizon + cfg.patch_len - 1) / cfg.patch_len;
+        let n_fc = horizon.div_ceil(cfg.patch_len);
         let total_patches = ctx_patches + n_fc;
         let rel_bias = self.compute_rel_bias(total_patches);
 
@@ -445,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn burn_matches_candle_on_synthetic_gguf() {
+    fn burn_forecast_golden() {
         let dir = std::env::temp_dir().join(format!("moment-burn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -475,23 +407,23 @@ mod tests {
         w.write_to(&mut std::io::BufWriter::new(f)).unwrap();
 
         let cfg = tiny_config();
-        let candle = crate::MomentModel::load(&path, cfg.clone()).unwrap();
         let burn = BurnMomentModel::load(&path, cfg).unwrap();
         let ctx: Vec<f32> = (0..8).map(|i| 10.0 + 0.5 * i as f32).collect();
         let t0 = std::time::Instant::now();
-        let a = candle.forecast(&ctx, 4).unwrap();
-        let candle_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let t0 = std::time::Instant::now();
-        let b = burn.forecast(&ctx, 4).unwrap();
+        let a = burn.forecast(&ctx, 4).unwrap();
         let burn_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        assert_eq!(a.len(), b.len());
-        let err: f32 = a
-            .iter()
-            .zip(b.iter())
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0, f32::max);
-        println!("moment synthetic: candle {candle_ms:.3}ms burn {burn_ms:.3}ms err {err:.2e}");
-        assert!(err < 1e-4, "moment Burn parity failed: {err:.2e}");
+        let b = burn.forecast(&ctx, 4).unwrap();
+        assert_eq!(a.len(), 4);
+        assert!(a.iter().all(|v| v.is_finite()));
+        assert!(a.iter().any(|&v| v != 0.0));
+        assert_eq!(a, b, "forecast must be deterministic");
+        println!("moment synthetic: burn {burn_ms:.3}ms out={a:?}");
+        // Golden values recorded from the verified Burn port.
+        let golden: [f32; 4] = [9.266289, 10.292548, 9.2582655, 10.252379];
+        assert_eq!(a.len(), golden.len());
+        for (x, y) in a.iter().zip(golden.iter()) {
+            assert!((x - y).abs() < 1e-4, "golden drift: {x} vs {y}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

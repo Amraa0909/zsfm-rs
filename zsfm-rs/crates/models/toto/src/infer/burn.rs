@@ -1,22 +1,18 @@
 //! Toto-2 inference on the Burn backend (Flex CPU).
 //!
-//! Bit-exact port of `super` (candle): patched input scaler, transformer
-//! with GQA time/variate layers, xPos RoPE, PerDimScale, unit-scaled linears,
-//! SwiGLU FFN, and quantile output head. Weight loading goes through the
-//! existing candle GGUF reader and converts each F32 tensor to Burn
-//! `TensorData`, so there is exactly one GGUF parser.
+//! Patched input scaler, transformer with GQA time/variate layers, xPos RoPE,
+//! PerDimScale, unit-scaled linears, SwiGLU FFN, and quantile output head,
+//! with weights loaded straight from GGUF via [`zsfm_burn::GgufWeights`].
 //!
 //! The `compute_f64` path is not ported: pass a config with
 //! `compute_f64 = false` (the default). The Burn port bails otherwise.
 
-use std::io::BufReader;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use burn::tensor::{activation, Device, Tensor, TensorData};
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device as CDevice};
 use zsfm_burn::linear::burn_linear_nd;
+use zsfm_burn::{open_gguf_weights, GgufWeights};
 
 use super::InferConfig;
 
@@ -26,43 +22,23 @@ fn device() -> Device {
     Device::flex()
 }
 
-fn burn2(t: &candle_core::Tensor) -> Result<Tensor<2>> {
-    zsfm_burn::burn_weight_2d(t, &device())
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
 }
 
-fn burn1(t: &candle_core::Tensor) -> Result<Tensor<1>> {
-    zsfm_burn::burn_weight_1d(t, &device())
+fn load_v(weights: &GgufWeights, name: &str) -> Result<Tensor<1>> {
+    weights.load_1d(name)
 }
 
-fn load_t(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<2>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn2(&t)
+fn try_load_v(weights: &GgufWeights, name: &str) -> Result<Option<Tensor<1>>> {
+    match weights.load_1d(name) {
+        Ok(t) => Ok(Some(t)),
+        Err(_) => Ok(None),
+    }
 }
 
-fn load_v(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Tensor<1>> {
-    let t = zsfm_nn::load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)?;
-    burn1(&t)
-}
-
-fn try_load_v(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
-    name: &str,
-) -> Result<Option<Tensor<1>>> {
-    Ok(
-        match zsfm_nn::try_load_tensor(content, reader, name, &CDevice::Cpu, DType::F32)? {
-            Some(t) => Some(burn1(&t)?),
-            None => None,
-        },
-    )
+fn load_w(weights: &GgufWeights, name: &str, expected_d_out: usize) -> Result<Tensor<2>> {
+    weights.load_weight_2d(name, expected_d_out)
 }
 
 /// Unit-scaled linear: `scale * (x @ w^T + b)` with `scale = 1/sqrt(d_in)`.
@@ -223,19 +199,18 @@ pub struct BurnTotoModel {
 }
 
 fn load_residual_mlp(
-    content: &gguf_file::Content,
-    reader: &mut (impl std::io::Read + std::io::Seek),
+    weights: &GgufWeights,
     prefix: &str,
     tau: f64,
     is_output: bool,
 ) -> Result<BurnResidualMlpW> {
     Ok(BurnResidualMlpW {
-        l1_w: load_t(content, reader, &format!("{prefix}.linear1.weight"))?,
-        l1_b: load_v(content, reader, &format!("{prefix}.linear1.bias"))?,
-        l2_w: load_t(content, reader, &format!("{prefix}.linear2.weight"))?,
-        l2_b: load_v(content, reader, &format!("{prefix}.linear2.bias"))?,
-        skip_w: load_t(content, reader, &format!("{prefix}.skip_proj.weight"))?,
-        skip_b: load_v(content, reader, &format!("{prefix}.skip_proj.bias"))?,
+        l1_w: load_t(weights, &format!("{prefix}.linear1.weight"))?,
+        l1_b: load_v(weights, &format!("{prefix}.linear1.bias"))?,
+        l2_w: load_t(weights, &format!("{prefix}.linear2.weight"))?,
+        l2_b: load_v(weights, &format!("{prefix}.linear2.bias"))?,
+        skip_w: load_t(weights, &format!("{prefix}.skip_proj.weight"))?,
+        skip_b: load_v(weights, &format!("{prefix}.skip_proj.bias"))?,
         tau,
         is_output,
     })
@@ -277,12 +252,10 @@ impl BurnTotoModel {
         if config.compute_f64 {
             bail!("BurnTotoModel supports compute_f64=false only");
         }
-        let file = std::fs::File::open(gguf_path)
+        let weights = open_gguf_weights(gguf_path)
             .with_context(|| format!("open {}", gguf_path.display()))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-        let content = gguf_file::Content::read(&mut reader).context("parse GGUF header")?;
 
-        let patch_proj = load_residual_mlp(&content, &mut reader, "patch_proj", 1.0, false)?;
+        let patch_proj = load_residual_mlp(&weights, "patch_proj", 1.0, false)?;
 
         let (attn_taus, mlp_taus) = compute_taus(
             config.num_layers,
@@ -292,44 +265,23 @@ impl BurnTotoModel {
         let mut blocks = Vec::with_capacity(config.num_layers);
         for n in 0..config.num_layers {
             blocks.push(BurnBlockW {
-                attn_qkv_w: load_t(&content, &mut reader, &format!("blk.{n}.attn_qkv.weight"))?,
-                attn_qkv_b: try_load_v(&content, &mut reader, &format!("blk.{n}.attn_qkv.bias"))?,
-                attn_out_w: load_t(
-                    &content,
-                    &mut reader,
-                    &format!("blk.{n}.attn_output.weight"),
-                )?,
-                attn_out_b: try_load_v(
-                    &content,
-                    &mut reader,
-                    &format!("blk.{n}.attn_output.bias"),
-                )?,
-                attn_pds: try_load_v(&content, &mut reader, &format!("blk.{n}.attn_pds.weight"))?,
+                attn_qkv_w: load_t(&weights, &format!("blk.{n}.attn_qkv.weight"))?,
+                attn_qkv_b: try_load_v(&weights, &format!("blk.{n}.attn_qkv.bias"))?,
+                attn_out_w: load_t(&weights, &format!("blk.{n}.attn_output.weight"))?,
+                attn_out_b: try_load_v(&weights, &format!("blk.{n}.attn_output.bias"))?,
+                attn_pds: try_load_v(&weights, &format!("blk.{n}.attn_pds.weight"))?,
                 attn_tau: attn_taus[n],
-                ffn_up_w: load_t(&content, &mut reader, &format!("blk.{n}.ffn_up.weight"))?,
-                ffn_down_w: {
-                    let t = zsfm_nn::load_tensor(
-                        &content,
-                        &mut reader,
-                        &format!("blk.{n}.ffn_down.weight"),
-                        &CDevice::Cpu,
-                        DType::F32,
-                    )?;
-                    // Mirror the Q8 realignment in super::load.
-                    let fixed = if t.dim(0)? != config.d_model {
-                        let d: Vec<f32> = t.t()?.contiguous()?.flatten_all()?.to_vec1()?;
-                        let d1 = t.dim(1)?;
-                        let d0 = t.dim(0)?;
-                        Tensor::<2>::from_data(TensorData::new(d, [d1, d0]), &device())
-                    } else {
-                        burn2(&t)?
-                    };
-                    fixed
-                },
+                ffn_up_w: load_t(&weights, &format!("blk.{n}.ffn_up.weight"))?,
+                // Mirror the Q8 realignment in super::load.
+                ffn_down_w: load_w(
+                    &weights,
+                    &format!("blk.{n}.ffn_down.weight"),
+                    config.d_model,
+                )?,
                 mlp_tau: mlp_taus[n],
             });
         }
-        let output_head = load_residual_mlp(&content, &mut reader, "output_head", 1.0, true)?;
+        let output_head = load_residual_mlp(&weights, "output_head", 1.0, true)?;
         let rope = BurnXposRope::build(config.qk_dim, 8192);
         Ok(Self {
             config,
@@ -689,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn burn_matches_candle_on_synthetic_gguf() {
+    fn burn_forecast_golden() {
         // d=16, heads=groups=4, qk=v=8, patch=4, 1 layer, all time layers.
         let dir = std::env::temp_dir().join(format!("toto-burn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -713,27 +665,37 @@ mod tests {
 
         let cfg = tiny_config();
         assert!(!cfg.compute_f64);
-        let candle = crate::TotoModel::load(&path, cfg.clone()).unwrap();
         let burn = BurnTotoModel::load(&path, cfg).unwrap();
         let ctx = vec![(0..8).map(|i| 10.0 + 0.5 * i as f32).collect::<Vec<_>>()];
         let mask = vec![vec![true; 8]];
         let t0 = std::time::Instant::now();
-        let a = candle.forecast(&ctx, &mask, 4).unwrap();
-        let candle_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let t0 = std::time::Instant::now();
-        let b = burn.forecast(&ctx, &mask, 4).unwrap();
+        let a = burn.forecast(&ctx, &mask, 4).unwrap();
         let burn_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        assert_eq!(a.len(), b.len());
-        let mut err = 0.0f32;
-        for (ra, rb) in a.iter().zip(b.iter()) {
-            for (va, vb) in ra.iter().zip(rb.iter()) {
-                for (x, y) in va.iter().zip(vb.iter()) {
-                    err = err.max((x - y).abs());
-                }
+        let b = burn.forecast(&ctx, &mask, 4).unwrap();
+        assert_eq!(a.len(), 9);
+        for q in &a {
+            assert_eq!(q.len(), 1);
+            for v in q {
+                assert_eq!(v.len(), 4);
             }
         }
-        println!("toto synthetic: candle {candle_ms:.1}ms burn {burn_ms:.1}ms err {err:.2e}");
-        assert!(err < 1e-3, "toto Burn parity failed: {err:.2e}");
+        assert!(a.iter().flatten().flatten().all(|v| v.is_finite()));
+        assert!(a.iter().flatten().flatten().any(|&v| v != 0.0));
+        assert_eq!(a, b, "forecast must be deterministic");
+        println!("toto synthetic: burn {burn_ms:.1}ms out={a:?}");
+        // Golden values recorded from the verified Burn port (ex-candle parity 1e-3).
+        let flat: Vec<f32> = a.iter().flatten().flatten().copied().collect();
+        let golden: [f32; 36] = [
+            11.704744, 11.739721, 11.7525215, 11.725984, 11.722208, 11.724002, 11.743584,
+            11.738862, 11.74826, 11.730129, 11.741938, 11.736687, 11.761163, 11.724331, 11.729776,
+            11.752375, 11.711724, 11.757467, 11.735854, 11.761217, 11.6961, 11.734921, 11.741099,
+            11.715156, 11.7233715, 11.694718, 11.721759, 11.7119465, 11.716567, 11.721282,
+            11.730694, 11.710778, 11.740484, 11.723714, 11.738366, 11.721424,
+        ];
+        assert_eq!(flat.len(), golden.len());
+        for (x, y) in flat.iter().zip(golden.iter()) {
+            assert!((x - y).abs() < 1e-4, "golden drift: {x} vs {y}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
