@@ -1,6 +1,6 @@
 # zsfm-rs — Zero-Shot Forecasters & Tabular Foundation Models in Rust
 
-> **One `zsfm` binary, 16 foundation models, no Python.** Download real weights from Hugging Face, convert to a single self-contained [GGUF](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md) file, and run zero-shot inference locally via [candle](https://github.com/huggingface/candle).
+> **One `zsfm` binary, 16 foundation models, no Python.** Download real weights from Hugging Face, convert to a single self-contained [GGUF](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md) file, and run zero-shot inference locally via [Burn](https://github.com/tracel-ai/burn).
 
 [![CI](https://github.com/amaye15/zsfm-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/amaye15/zsfm-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -12,7 +12,7 @@
 
 ## What is this?
 
-`zsfm-rs` is a Rust workspace that ports **11 zero-shot time-series forecasters** and **5 tabular foundation models** to a unified GGUF + candle stack. Each port is verified **bit-exact** (or within F32 rounding, ~1e-6–1e-7) tensor-for-tensor against the original PyTorch checkpoint before being considered done — no re-training, no approximations, just the original published weights re-encoded.
+`zsfm-rs` is a Rust workspace that ports **11 zero-shot time-series forecasters** and **5 tabular foundation models** to a unified GGUF + Burn stack. Each port is verified **bit-exact** (or within F32 rounding, ~1e-6–1e-7) tensor-for-tensor against the original PyTorch checkpoint before being considered done — no re-training, no approximations, just the original published weights re-encoded.
 
 There are two halves — plus a cleanup helper:
 
@@ -20,7 +20,7 @@ There are two halves — plus a cleanup helper:
 2. **Infer** — `zsfm <model> infer --gguf <file> < request.json` loads that GGUF and returns a forecast / tabular prediction. No PyTorch, no Python runtime.
 3. **Delete** — `zsfm <model> delete` removes the cached `model-f32.gguf` + `config.json` (and optionally an output GGUF) to free disk (`zsfm chronos delete --output gguf/chronos-f16.gguf`).
 
-The same GGUF file works with any GGUF consumer; `infer` just happens to use candle.
+The same GGUF file works with any GGUF consumer; `infer` just happens to use Burn.
 
 **Docs:** [User Guide (mdBook)](https://amaye15.github.io/zsfm-rs/guide/) · [API docs (rustdoc)](https://amaye15.github.io/zsfm-rs/api/) · [Benchmark](benchmark.md)
 
@@ -105,7 +105,7 @@ zsfm --help
 
 > macOS Intel (`x86_64-apple-darwin`) is not currently published (GitHub's free Intel runner capacity was cut). Use `cargo install` above instead — the workspace builds fine on Intel Macs.
 
-On macOS the release profile automatically links Apple's Accelerate framework for faster BLAS; on Linux/Windows it falls back to candle's portable backend with no extra setup.
+On macOS the release profile automatically links Apple's Accelerate framework for faster BLAS; on Linux/Windows it falls back to the portable CPU backend with no extra setup.
 
 Verify:
 
@@ -256,7 +256,7 @@ zsfm chronos delete --output gguf/chronos-f16.gguf  # also removes the converted
 zsfm chronos delete --model custom/repo --model-dir /tmp/models  # custom locations
 ```
 
-Most `convert` commands accept `--dtype f32|f16|q8`. BF16 is available only through the generic converter (candle can't currently load GGUF BF16 back).
+Most `convert` commands accept `--dtype f32|f16|q8`. BF16 is available only through the generic converter (the model loaders support F32/F16/Q8_0).
 
 #### Generic converter
 
@@ -316,9 +316,9 @@ See also [benchmark/optimisation_log.md](benchmark/optimisation_log.md) for infe
 │   │   ├── zsfm-hub/         # HF download/upload + canonical-F32 cache helpers
 │   │   ├── zsfm-checkpoint/  # checkpoint loader (safetensors/pickle/ONNX/HDF5/npz/ckpt/gguf) + dtype casting
 │   │   ├── zsfm-core/        # `Forecaster` trait, JSON envelope, config helpers
-│   │   ├── zsfm-nn/          # shared candle tensor ops
+│   │   ├── zsfm-burn/        # shared Burn tensor ops + direct GGUF weight loading
 │   │   ├── zsfm-bench/       # in-process benchmark + ensembling
-│   │   └── models/           # one crate per model (arch + weight mapping + candle kernels)
+│   │   └── models/           # one crate per model (arch + weight mapping + Burn inference)
 │   │       ├── toto/ chronos/ timesfm/ sundial/ ttm/ lag_llama/ moment/
 │   │       ├── moirai/ moirai2/ flowstate/ tirex/   # forecasters
 │   │       └── mitra/ tabdpt/ tabicl/ tabpfn/ tabfm/ # tabular
@@ -349,7 +349,7 @@ See also [benchmark/optimisation_log.md](benchmark/optimisation_log.md) for infe
 └── LICENSE (MIT)
 ```
 
-Each model crate under `zsfm-rs/crates/models/` owns its architecture, checkpoint weight-name mapping, and candle kernels; `zsfm` (`zsfm-rs/crates/zsfm/`) only wires them to the CLI.
+Each model crate under `zsfm-rs/crates/models/` owns its architecture, checkpoint weight-name mapping, and Burn inference; `zsfm` (`zsfm-rs/crates/zsfm/`) only wires them to the CLI.
 
 ---
 
@@ -372,7 +372,7 @@ CI (`.github/workflows/ci.yml:1`) runs both on every push to `main` and every PR
 
 ### Adding a new model
 
-1. New crate at `zsfm-rs/crates/models/<name>/` (weight mapping + candle inference + request/response types).
+1. New crate at `zsfm-rs/crates/models/<name>/` (weight mapping + Burn inference + request/response types).
 2. Module at `zsfm/src/<name>.rs` (`zsfm-rs/crates/zsfm/src/<name>.rs`) with `convert`/`infer` subcommands — follow the caching pattern in [The `zsfm` CLI](docs-guide/src/cli-overview.md#model-caching) (`zsfm_hub::canonical_gguf_path` + `zsfm_checkpoint::recast`).
 3. Wire it into `zsfm/src/main.rs:ModelCommand` (`zsfm-rs/crates/zsfm/src/main.rs`).
 4. Add a page under `docs-guide/src/models/` and a row in the model table.
@@ -398,7 +398,7 @@ mdbook serve docs-guide
 
 ## Licensing
 
-**Code** in this repository (converters, GGUF writer/reader, CLI, candle kernels, bench) is **MIT** — see [LICENSE](LICENSE).
+**Code** in this repository (converters, GGUF writer/reader, CLI, Burn inference, bench) is **MIT** — see [LICENSE](LICENSE).
 
 **Model weights** keep the license their original authors published. Converting with `zsfm <model> convert` downloads the original weights and re-encodes them as GGUF — it does not change ownership or terms. Check before using a GGUF beyond local experimentation:
 
@@ -420,7 +420,7 @@ For the restricted models, see the license file in each HF repo (linked in the t
 
 This workspace is a packaging and portability layer — all modeling credit belongs to the original authors. Each crate and each page in [Time-series forecasters](docs-guide/src/models/time-series.md) / [Tabular foundation models](docs-guide/src/models/tabular.md) links back to the original Hugging Face weights, source repository, and paper. If you use these models in academic work, please cite the relevant paper(s) from those pages.
 
-Built on [candle](https://github.com/huggingface/candle) (Hugging Face) and the [GGUF](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md) format (ggml/ggerganov).
+Built on [Burn](https://github.com/tracel-ai/burn) and the [GGUF](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md) format (ggml/ggerganov).
 
 ---
 

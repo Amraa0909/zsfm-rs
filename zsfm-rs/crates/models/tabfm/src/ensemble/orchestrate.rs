@@ -1,5 +1,5 @@
 //! Orchestrates one full `ensemble-predict` call: builds the `n_estimators` member configs,
-//! runs each member's preprocessing + a single `TabFMModel::predict` forward pass (reusing the
+//! runs each member's preprocessing + a single `BurnTabFMModel::predict` forward pass (reusing the
 //! core model unchanged), then aggregates — optionally applying calibration/NNLS ensemble
 //! weighting fit via `oof.rs`'s out-of-fold procedure.
 
@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use serde_json::Value;
 
-use crate::infer::TabFMModel;
+use crate::infer::BurnTabFMModel;
 
 use super::aggregate::{self, ClassAggMode};
 use super::calibration::{PlattParams, VectorScalingParams};
@@ -53,7 +53,7 @@ pub struct EnsembleParams {
     pub(crate) enable_nnls: bool,
     pub(crate) nnls_beta: f64,
     pub(crate) calibration_lambda: f64,
-    /// Members per `TabFMModel::predict_batch` call. `None` (default) chunks members into groups
+    /// Members per `BurnTabFMModel::predict_batch` call. `None` (default) chunks members into groups
     /// of `DEFAULT_BATCH_CHUNK_SIZE`, run in parallel via `rayon` — measured faster than one giant
     /// batch of all `n_estimators` (attention cost scales with `B*T^2`, so a single huge batch
     /// doesn't get the BLAS efficiency win a batched *linear* layer would, while still giving up
@@ -154,7 +154,7 @@ pub struct RegressionOutput {
     pub predictions: Vec<f64>, // [n_test]
 }
 
-/// One member's preprocessed table, ready for `TabFMModel::predict`.
+/// One member's preprocessed table, ready for `BurnTabFMModel::predict`.
 struct MemberTable {
     x: Vec<Vec<f32>>, // [n_train+n_test][n_features]
     cat_mask: Vec<bool>,
@@ -264,13 +264,13 @@ fn build_member_table(
 /// Runs every ensemble member's forward pass for classification, given a train/query row split
 /// (query rows may be real held-out test rows, or an OOF fold's validation rows). Members are
 /// grouped into `batch_size`-sized chunks (default: `DEFAULT_BATCH_CHUNK_SIZE`) and each chunk
-/// runs as a **single** `TabFMModel::predict_batch` call — sharing the fixed cost of the model's
+/// runs as a **single** `BurnTabFMModel::predict_batch` call — sharing the fixed cost of the model's
 /// deepest stage (24-block ICL) across the whole chunk instead of paying it once per member.
 /// Chunks run in parallel via `rayon`, combining with Round 1's parallelism.
 /// Returns `[member][query_row][class]` logits, already un-shifted back to original class order.
 #[allow(clippy::too_many_arguments)]
 pub fn run_members_classification(
-    model: &TabFMModel,
+    model: &BurnTabFMModel,
     x_train_raw: &[Vec<Value>],
     y_train_codes: &[f64],
     x_query_raw: &[Vec<Value>],
@@ -356,7 +356,7 @@ pub fn run_members_classification(
 /// Same idea for regression: returns `[member][query_row]` *scaled* (not yet inverse-transformed)
 /// predictions.
 pub fn run_members_regression(
-    model: &TabFMModel,
+    model: &BurnTabFMModel,
     x_train_raw: &[Vec<Value>],
     y_train_scaled: &[f64],
     x_query_raw: &[Vec<Value>],
@@ -433,7 +433,7 @@ fn class_agg_mode<'a>(p: &EnsembleParams, nnls_weights: &'a Option<Vec<f64>>) ->
 }
 
 pub fn run_classification(
-    model: &TabFMModel,
+    model: &BurnTabFMModel,
     x_train_raw: &[Vec<Value>],
     y_train_raw: &[Value],
     x_test_raw: &[Vec<Value>],
@@ -598,7 +598,7 @@ pub fn run_classification(
 }
 
 pub fn run_regression(
-    model: &TabFMModel,
+    model: &BurnTabFMModel,
     x_train_raw: &[Vec<Value>],
     y_train_raw: &[f64],
     x_test_raw: &[Vec<Value>],

@@ -6,4 +6,4 @@ pub mod tensor_map;
 
 pub use config::TabFMConfig;
 pub use ensemble::orchestrate::EnsembleParams;
-pub use infer::{InferConfig, TabFMModel, TabFMModelBuilder};
+pub use infer::BurnTabFMModel;

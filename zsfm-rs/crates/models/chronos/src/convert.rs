@@ -82,10 +82,10 @@ pub fn convert(
             let innermost = py_shape.last().copied().unwrap_or(1);
             let outermost = py_shape.first().copied().unwrap_or(1);
 
-            // Q8_0: candle requires the innermost dim (last Python dim, first GGUF dim) to be
+            // Q8_0: Q8_0 blocks need the innermost dim (last Python dim, first GGUF dim) to be
             // divisible by 32. When it isn't for a 2D weight whose outermost dim is aligned,
-            // transpose data and store GGUF shape in Python order (not reversed). Candle
-            // reverses the shape at load time, placing the aligned dim innermost. The inference
+            // transpose data and store GGUF shape in Python order (not reversed). The GGUF shape as stored
+            // is reversed back at load time, placing the aligned dim innermost. The inference
             // loader detects the transposition by checking dim(0) against the expected d_out.
             let (dst_dtype, gguf_shape, tensor_data) = if opts.output_dtype == GGMLType::Q8_0
                 && (innermost % 32 != 0 || n_elems % 32 != 0)

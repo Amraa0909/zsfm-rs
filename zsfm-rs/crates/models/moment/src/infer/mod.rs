@@ -1,106 +1,99 @@
-//! MOMENT-1-large inference engine.
+//! MOMENT-1-large Burn-only inference engine (Burn backend, Flex CPU).
 //!
-//! Architecture: T5 encoder-only transformer with patch embeddings.
-//! - RevIN normalization → patch embedding (value + position) →
-//!   24 T5 encoder blocks (RMSNorm + relative-bias MHA + gated-GELU FFN) →
-//!   final RMSNorm → per-patch reconstruction head
-//! - Zero-shot forecasting: iteratively predict 8 steps at a time using
-//!   the reconstruction head applied to the last patch's encoder output.
+//! RevIN, patch embedding with mask tokens, T5 relative-bias encoder
+//! blocks, gated-GELU FFN, reconstruction head, with weights loaded
+//! straight from GGUF via [`zsfm_burn::GgufWeights`].
 
-use std::collections::HashMap;
-use std::io::{BufReader, Read, Seek};
 use std::path::Path;
-use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device, Tensor, D};
+use burn::tensor::{activation, Device, Tensor, TensorData};
+use zsfm_burn::{open_gguf_weights, GgufWeights};
 
 use crate::config::MomentConfig;
 
-pub mod burn;
-
-// ---------------------------------------------------------------------------
-// Weight structs
-// ---------------------------------------------------------------------------
-
-struct EncoderBlock {
-    attn_qkv_w: Tensor, // fused [3*d_model, d_model]
-    attn_o_w: Tensor,
-    attn_norm_w: Tensor,
-    ffn_wi0_w: Tensor,
-    ffn_wi1_w: Tensor,
-    ffn_wo_w: Tensor,
-    ffn_norm_w: Tensor,
+fn device() -> Device {
+    Device::flex()
 }
 
-pub struct MomentModel {
-    device: Device,
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
+}
+
+fn load_v(weights: &GgufWeights, name: &str) -> Result<Tensor<1>> {
+    weights.load_1d(name)
+}
+
+fn load_flat(weights: &GgufWeights, name: &str) -> Result<Vec<f32>> {
+    weights.load_flat(name)
+}
+
+fn linear(x: Tensor<2>, w: Tensor<2>, b: Option<Tensor<1>>) -> Tensor<2> {
+    match b {
+        Some(bias) => zsfm_burn::linear::burn_linear_bias(x, w, bias),
+        None => zsfm_burn::linear::burn_linear_nobias(x, w),
+    }
+}
+
+fn rms(x: Tensor<2>, w: Tensor<1>, eps: f32) -> Tensor<2> {
+    zsfm_burn::norm::burn_rms_norm(x, w, eps)
+}
+
+struct BurnEncoderBlock {
+    attn_qkv_w: Tensor<2>,
+    attn_o_w: Tensor<2>,
+    attn_norm_w: Tensor<1>,
+    ffn_wi0_w: Tensor<2>,
+    ffn_wi1_w: Tensor<2>,
+    ffn_wo_w: Tensor<2>,
+    ffn_norm_w: Tensor<1>,
+}
+
+pub struct BurnMomentModel {
     config: MomentConfig,
-    patch_embed_w: Tensor,   // [1024, 8]  value embedding (no bias)
-    pos_embed: Tensor,       // [1, 5000, 1024]
-    mask_embed: Tensor,      // [1024]  learned token for masked (future) patches
-    rel_bias_data: Vec<f32>, // [32 * 16] flat, precomputed from rel_bias_w
-    blocks: Vec<EncoderBlock>,
-    norm_f_w: Tensor,
-    head_w: Tensor, // [8, 1024]
-    head_b: Tensor, // [8]
-    rel_bias_cache: Mutex<HashMap<usize, Tensor>>,
+    patch_embed_w: Tensor<2>,
+    pos_embed: Tensor<3>,
+    mask_embed: Tensor<1>,
+    rel_bias_data: Vec<f32>,
+    blocks: Vec<BurnEncoderBlock>,
+    norm_f_w: Tensor<1>,
+    head_w: Tensor<2>,
+    head_b: Tensor<1>,
 }
 
-// ---------------------------------------------------------------------------
-// GGUF loading
-// ---------------------------------------------------------------------------
-
-fn load_t(
-    content: &gguf_file::Content,
-    reader: &mut (impl Read + Seek),
-    name: &str,
-    device: &Device,
-) -> Result<Tensor> {
-    zsfm_nn::load_tensor(content, reader, name, device, DType::F32)
-}
-
-impl MomentModel {
+impl BurnMomentModel {
     pub fn load(gguf_path: &Path, config: MomentConfig) -> Result<Self> {
-        let device = Device::Cpu;
-        let file = std::fs::File::open(gguf_path)
+        let weights = open_gguf_weights(gguf_path)
             .with_context(|| format!("open {}", gguf_path.display()))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-        let content = gguf_file::Content::read(&mut reader).context("parse GGUF header")?;
 
-        let patch_embed_w = load_t(&content, &mut reader, "patch_embed.weight", &device)?;
-        let pos_embed = load_t(&content, &mut reader, "pos_embed.pe", &device)?;
-        let mask_embed = load_t(&content, &mut reader, "mask_embed", &device)?;
-        let rel_bias_data = load_t(&content, &mut reader, "blk.0.attn_rel_bias.weight", &device)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
+        let patch_embed_w = load_t(&weights, "patch_embed.weight")?;
+        let pos_embed: Tensor<3> = weights.load_3d("pos_embed.pe")?;
+        let mask_embed = load_v(&weights, "mask_embed")?;
+        let rel_bias_data: Vec<f32> = load_flat(&weights, "blk.0.attn_rel_bias.weight")?;
 
         let mut blocks = Vec::with_capacity(config.n_layers);
         for n in 0..config.n_layers {
             let p = |s: &str| format!("blk.{n}.{s}");
-            let q_w = load_t(&content, &mut reader, &p("attn_q.weight"), &device)?;
-            let k_w = load_t(&content, &mut reader, &p("attn_k.weight"), &device)?;
-            let v_w = load_t(&content, &mut reader, &p("attn_v.weight"), &device)?;
-            let attn_qkv_w =
-                Tensor::cat(&[&q_w, &k_w, &v_w], 0).with_context(|| format!("qkv cat blk.{n}"))?;
-            blocks.push(EncoderBlock {
+            let qw = load_t(&weights, &p("attn_q.weight"))?;
+            let kw = load_t(&weights, &p("attn_k.weight"))?;
+            let vw = load_t(&weights, &p("attn_v.weight"))?;
+            let attn_qkv_w = Tensor::cat(vec![qw, kw, vw], 0);
+            blocks.push(BurnEncoderBlock {
                 attn_qkv_w,
-                attn_o_w: load_t(&content, &mut reader, &p("attn_o.weight"), &device)?,
-                attn_norm_w: load_t(&content, &mut reader, &p("attn_norm.weight"), &device)?,
-                ffn_wi0_w: load_t(&content, &mut reader, &p("ffn_wi0.weight"), &device)?,
-                ffn_wi1_w: load_t(&content, &mut reader, &p("ffn_wi1.weight"), &device)?,
-                ffn_wo_w: load_t(&content, &mut reader, &p("ffn_wo.weight"), &device)?,
-                ffn_norm_w: load_t(&content, &mut reader, &p("ffn_norm.weight"), &device)?,
+                attn_o_w: load_t(&weights, &p("attn_o.weight"))?,
+                attn_norm_w: load_v(&weights, &p("attn_norm.weight"))?,
+                ffn_wi0_w: load_t(&weights, &p("ffn_wi0.weight"))?,
+                ffn_wi1_w: load_t(&weights, &p("ffn_wi1.weight"))?,
+                ffn_wo_w: load_t(&weights, &p("ffn_wo.weight"))?,
+                ffn_norm_w: load_v(&weights, &p("ffn_norm.weight"))?,
             });
         }
 
-        let norm_f_w = load_t(&content, &mut reader, "norm_f.weight", &device)?;
-        let head_w = load_t(&content, &mut reader, "head.weight", &device)?;
-        let head_b = load_t(&content, &mut reader, "head.bias", &device)?;
+        let norm_f_w = load_v(&weights, "norm_f.weight")?;
+        let head_w = load_t(&weights, "head.weight")?;
+        let head_b = load_v(&weights, "head.bias")?;
 
         Ok(Self {
-            device,
             config,
             patch_embed_w,
             pos_embed,
@@ -110,213 +103,160 @@ impl MomentModel {
             norm_f_w,
             head_w,
             head_b,
-            rel_bias_cache: Mutex::new(HashMap::new()),
         })
     }
 
-    // -----------------------------------------------------------------------
-    // Forecasting
-    // -----------------------------------------------------------------------
-
-    /// Zero-shot forecasting via single-pass masked inpainting.
-    ///
-    /// Appends `n_forecast_patches` zero-filled future patches after the 64
-    /// context patches and runs ONE T5 encoder pass. The bidirectional encoder
-    /// fills the masked future positions using the real context, mirroring
-    /// the masking pretraining task. Head applied to future positions gives
-    /// the forecast.
     pub fn forecast(&self, context: &[f32], horizon: usize) -> Result<Vec<f32>> {
         let cfg = &self.config;
-        let patch_len = cfg.patch_len;
-        let seq_len = cfg.seq_len;
-        let ctx_patches = seq_len / cfg.patch_stride; // 64
-
-        // RevIN normalization
         let (loc, scale) = revin_stats(context);
         let scale = scale.max(1e-8);
-
-        // Scale and pad/truncate context to seq_len
         let mut ctx_scaled: Vec<f32> = context.iter().map(|&v| (v - loc) / scale).collect();
-        if ctx_scaled.len() < seq_len {
-            let pad = seq_len - ctx_scaled.len();
+        if ctx_scaled.len() < cfg.seq_len {
+            let pad = cfg.seq_len - ctx_scaled.len();
             let mut padded = vec![0.0f32; pad];
             padded.extend_from_slice(&ctx_scaled);
             ctx_scaled = padded;
-        } else if ctx_scaled.len() > seq_len {
-            let start = ctx_scaled.len() - seq_len;
+        } else if ctx_scaled.len() > cfg.seq_len {
+            let start = ctx_scaled.len() - cfg.seq_len;
             ctx_scaled = ctx_scaled[start..].to_vec();
         }
 
-        // Number of future patches to generate
-        let n_fc = (horizon + patch_len - 1) / patch_len;
+        let ctx_patches = cfg.seq_len / cfg.patch_stride;
+        let n_fc = horizon.div_ceil(cfg.patch_len);
         let total_patches = ctx_patches + n_fc;
+        let rel_bias = self.compute_rel_bias(total_patches);
 
-        let rel_bias = {
-            let mut cache = self
-                .rel_bias_cache
-                .lock()
-                .map_err(|_| anyhow::anyhow!("cache mutex poisoned"))?;
-            if !cache.contains_key(&total_patches) {
-                cache.insert(total_patches, self.compute_rel_bias(total_patches)?);
-            }
-            cache[&total_patches].clone()
-        };
-
-        // Single encoder pass: context patches + mask_embed for future positions
-        let ctx_patches_data = patchify(&ctx_scaled, patch_len, cfg.patch_stride, ctx_patches);
-        let mut h = self.embed_patches_with_mask(&ctx_patches_data, n_fc, total_patches)?;
+        let ctx_data = patchify(&ctx_scaled, cfg.patch_len, cfg.patch_stride, ctx_patches);
+        let mut h = self.embed_patches_with_mask(&ctx_data, n_fc, total_patches);
         for blk in &self.blocks {
-            h = self.forward_block(&h, blk, &rel_bias, total_patches)?;
+            h = self.forward_block(h, blk, rel_bias.clone(), total_patches);
         }
-        h = zsfm_nn::rms_norm(&h, Some(&self.norm_f_w), cfg.layer_norm_eps)?;
-
-        // Apply head to future positions
-        let future_h = h.narrow(0, ctx_patches, n_fc)?; // [n_fc, 1024]
-        let pred = zsfm_nn::linear_bias(&future_h, &self.head_w, &self.head_b)?; // [n_fc, 8]
-
-        let pred_flat: Vec<f32> = pred.flatten_all()?.to_vec1()?;
-        let result: Vec<f32> = pred_flat
+        h = rms(h, self.norm_f_w.clone(), cfg.layer_norm_eps as f32);
+        let future_h: Tensor<2> = h.narrow(0, ctx_patches, n_fc);
+        let pred = linear(future_h, self.head_w.clone(), Some(self.head_b.clone()));
+        let pred_flat: Vec<f32> = pred
+            .to_data()
+            .try_to_vec()
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        Ok(pred_flat
             .iter()
             .take(horizon)
             .map(|&v| v * scale + loc)
-            .collect();
-
-        Ok(result)
+            .collect())
     }
 
-    /// Embed context patches via value_embedding, then append n_fc mask tokens.
     fn embed_patches_with_mask(
         &self,
         ctx_patches: &[Vec<f32>],
         n_fc: usize,
         total_patches: usize,
-    ) -> Result<Tensor> {
+    ) -> Tensor<2> {
         let cfg = &self.config;
-        let patch_len = cfg.patch_len;
-        let d_model = cfg.d_model;
-        let ctx_n = ctx_patches.len();
-
-        // Context: value_embedding(patch) → [ctx_n, d_model]
+        let dev = device();
         let flat: Vec<f32> = ctx_patches.iter().flatten().copied().collect();
-        let x = Tensor::from_vec(flat, (ctx_n, patch_len), &self.device)?;
-        let h_ctx = x.matmul(&self.patch_embed_w.t()?)?;
-
-        // Future: expand mask_embed [d_model] → [n_fc, d_model]
+        let x = Tensor::<2>::from_data(
+            TensorData::new(flat, [ctx_patches.len(), cfg.patch_len]),
+            &dev,
+        );
+        let h_ctx = x.matmul(self.patch_embed_w.clone().transpose());
         let h_fc = self
             .mask_embed
-            .unsqueeze(0)?
-            .broadcast_as((n_fc, d_model))?;
-
-        // Concatenate: [total_patches, d_model]
-        let h = Tensor::cat(&[h_ctx, h_fc], 0)?;
-
-        // Position embedding: pe is [1, 5000, d_model]; take [:total_patches]
-        let pos = self.pos_embed.squeeze(0)?.narrow(0, 0, total_patches)?;
-
-        Ok((h + pos)?)
+            .clone()
+            .unsqueeze_dim::<2>(0)
+            .expand([n_fc, cfg.d_model]);
+        let h = Tensor::cat(vec![h_ctx, h_fc], 0);
+        let pos: Tensor<2> = self
+            .pos_embed
+            .clone()
+            .squeeze_dim::<2>(0)
+            .narrow(0, 0, total_patches);
+        h + pos
     }
 
     fn forward_block(
         &self,
-        hidden: &Tensor,
-        blk: &EncoderBlock,
-        rel_bias: &Tensor, // [1, n_heads, seq, seq]
+        hidden: Tensor<2>,
+        blk: &BurnEncoderBlock,
+        rel_bias: Tensor<4>,
         seq_len: usize,
-    ) -> Result<Tensor> {
-        // Pre-norm attention (with residual)
-        let res = hidden;
-        let h = zsfm_nn::rms_norm(hidden, Some(&blk.attn_norm_w), self.config.layer_norm_eps)?;
-        let h = self.t5_self_attn(&h, blk, rel_bias, seq_len)?;
-        let h = (h + res)?;
-
-        // Pre-norm FFN (with residual)
-        let res2 = h.clone();
-        let h2 = zsfm_nn::rms_norm(&h, Some(&blk.ffn_norm_w), self.config.layer_norm_eps)?;
-        let h2 = gated_gelu_ffn(&h2, &blk.ffn_wi0_w, &blk.ffn_wi1_w, &blk.ffn_wo_w)?;
-        Ok((h2 + res2)?)
+    ) -> Tensor<2> {
+        let h = rms(
+            hidden.clone(),
+            blk.attn_norm_w.clone(),
+            self.config.layer_norm_eps as f32,
+        );
+        let h = self.t5_self_attn(h, blk, rel_bias, seq_len);
+        let h = h + hidden;
+        let h2 = rms(
+            h.clone(),
+            blk.ffn_norm_w.clone(),
+            self.config.layer_norm_eps as f32,
+        );
+        let h2 = gated_gelu_ffn(h2, &blk.ffn_wi0_w, &blk.ffn_wi1_w, &blk.ffn_wo_w);
+        h2 + h
     }
 
     fn t5_self_attn(
         &self,
-        hidden: &Tensor,
-        blk: &EncoderBlock,
-        rel_bias: &Tensor, // [1, n_heads, seq, seq]
+        hidden: Tensor<2>,
+        blk: &BurnEncoderBlock,
+        rel_bias: Tensor<4>,
         seq_len: usize,
-    ) -> Result<Tensor> {
+    ) -> Tensor<2> {
         let cfg = &self.config;
-        let n_heads = cfg.n_heads;
-        let head_dim = cfg.head_dim;
-        let d_model = cfg.d_model;
-
-        // Project: single fused matmul → [seq, 3*d_model]
-        let qkv = zsfm_nn::linear_nobias(hidden, &blk.attn_qkv_w)?;
-        let q = qkv.narrow(D::Minus1, 0, d_model)?;
-        let k = qkv.narrow(D::Minus1, d_model, d_model)?;
-        let v = qkv.narrow(D::Minus1, 2 * d_model, d_model)?;
-
-        // Reshape to [n_heads, seq, head_dim]
-        let q = q
-            .reshape((seq_len, n_heads, head_dim))?
-            .permute((1, 0, 2))?
-            .contiguous()?;
-        let k = k
-            .reshape((seq_len, n_heads, head_dim))?
-            .permute((1, 0, 2))?
-            .contiguous()?;
-        let v = v
-            .reshape((seq_len, n_heads, head_dim))?
-            .permute((1, 0, 2))?
-            .contiguous()?;
-
-        // T5 does NOT scale by sqrt(head_dim) — scaling is absorbed into weight init
-        let scores = q.matmul(&k.permute((0, 2, 1))?)?; // [n_heads, seq, seq]
-                                                        // Add relative position bias (broadcast over batch dim)
-        let rel_bias_squeezed = rel_bias.squeeze(0)?; // [n_heads, seq, seq]
-        let scores = (scores + rel_bias_squeezed)?;
-        let attn = candle_nn::ops::softmax_last_dim(&scores)?;
-
-        // Weighted sum
-        let out = attn.matmul(&v)?; // [n_heads, seq, head_dim]
-        let out = out
-            .permute((1, 0, 2))?
-            .contiguous()?
-            .reshape((seq_len, d_model))?;
-
-        zsfm_nn::linear_nobias(&out, &blk.attn_o_w)
+        let qkv = linear(hidden, blk.attn_qkv_w.clone(), None);
+        let q: Tensor<2> = qkv.clone().narrow(1, 0, cfg.d_model);
+        let k: Tensor<2> = qkv.clone().narrow(1, cfg.d_model, cfg.d_model);
+        let v: Tensor<2> = qkv.narrow(1, 2 * cfg.d_model, cfg.d_model);
+        let split = |t: Tensor<2>| {
+            t.reshape([seq_len, cfg.n_heads, cfg.head_dim])
+                .permute([1, 0, 2])
+        };
+        let (q, k, v) = (split(q), split(k), split(v));
+        let scores = q.matmul(k.permute([0, 2, 1]));
+        let rel: Tensor<3> = rel_bias.squeeze_dim(0);
+        let scores = scores + rel;
+        let attn = activation::softmax(scores, 2);
+        let out = attn.matmul(v);
+        let out: Tensor<2> = out.permute([1, 0, 2]).reshape([seq_len, cfg.d_model]);
+        linear(out, blk.attn_o_w.clone(), None)
     }
 
-    /// Compute T5 relative position bias for a given sequence length.
-    fn compute_rel_bias(&self, seq_len: usize) -> Result<Tensor> {
+    fn compute_rel_bias(&self, seq_len: usize) -> Tensor<4> {
         let cfg = &self.config;
-        let n_heads = cfg.n_heads;
-        let num_buckets = cfg.rel_attn_num_buckets; // 32
-        let max_distance = cfg.rel_attn_max_distance; // 128
-
-        let mut out = vec![0.0f32; n_heads * seq_len * seq_len];
+        let mut out = vec![0.0f32; cfg.n_heads * seq_len * seq_len];
         for query_pos in 0..seq_len {
             for key_pos in 0..seq_len {
                 let rel = key_pos as i64 - query_pos as i64;
-                let bucket = t5_relative_bucket(rel, true, num_buckets, max_distance);
-                for head in 0..n_heads {
-                    // bias_data: row=bucket, col=head → index = bucket*n_heads + head
-                    let bias_val = self.rel_bias_data[bucket * n_heads + head];
-                    out[head * seq_len * seq_len + query_pos * seq_len + key_pos] = bias_val;
+                let bucket = t5_relative_bucket(
+                    rel,
+                    true,
+                    cfg.rel_attn_num_buckets,
+                    cfg.rel_attn_max_distance,
+                );
+                for head in 0..cfg.n_heads {
+                    out[head * seq_len * seq_len + query_pos * seq_len + key_pos] =
+                        self.rel_bias_data[bucket * cfg.n_heads + head];
                 }
             }
         }
-
-        // Shape: [1, n_heads, seq, seq]
-        Ok(Tensor::from_vec(
-            out,
-            (1, n_heads, seq_len, seq_len),
-            &self.device,
-        )?)
+        Tensor::<4>::from_data(
+            TensorData::new(out, [1, cfg.n_heads, seq_len, seq_len]),
+            &device(),
+        )
     }
 }
 
-// ---------------------------------------------------------------------------
-// T5 relative position bucket
-// ---------------------------------------------------------------------------
+fn gated_gelu_ffn(
+    x: Tensor<2>,
+    wi0_w: &Tensor<2>,
+    wi1_w: &Tensor<2>,
+    wo_w: &Tensor<2>,
+) -> Tensor<2> {
+    let gate = activation::gelu(linear(x.clone(), wi0_w.clone(), None));
+    let value = linear(x, wi1_w.clone(), None);
+    linear(gate * value, wo_w.clone(), None)
+}
 
 fn t5_relative_bucket(
     relative_position: i64,
@@ -326,19 +266,16 @@ fn t5_relative_bucket(
 ) -> usize {
     let mut ret = 0usize;
     let mut num_buckets = num_buckets;
-
     let n: usize = if bidirectional {
-        num_buckets /= 2; // each direction gets half the buckets
+        num_buckets /= 2;
         if relative_position > 0 {
-            ret += num_buckets; // positive offset for future positions
+            ret += num_buckets;
         }
         relative_position.unsigned_abs() as usize
     } else {
         (-relative_position).max(0) as usize
     };
-
     let max_exact = num_buckets / 2;
-
     if n < max_exact {
         ret += n;
     } else {
@@ -347,27 +284,9 @@ fn t5_relative_bucket(
                 * (num_buckets - max_exact) as f32) as usize;
         ret += val.min(num_buckets - 1);
     }
-
     ret
 }
 
-// ---------------------------------------------------------------------------
-// Ops
-// ---------------------------------------------------------------------------
-
-/// T5 gated-GELU FFN: out = wo(gelu(wi_0(x)) * wi_1(x))
-fn gated_gelu_ffn(x: &Tensor, wi0_w: &Tensor, wi1_w: &Tensor, wo_w: &Tensor) -> Result<Tensor> {
-    let gate = zsfm_nn::linear_nobias(x, wi0_w)?.gelu_erf()?;
-    let value = zsfm_nn::linear_nobias(x, wi1_w)?;
-    let h = (gate * value)?;
-    zsfm_nn::linear_nobias(&h, wo_w)
-}
-
-// ---------------------------------------------------------------------------
-// Preprocessing
-// ---------------------------------------------------------------------------
-
-/// Compute mean and std of x for RevIN normalization.
 fn revin_stats(x: &[f32]) -> (f32, f32) {
     let n = x.len() as f64;
     if n == 0.0 {
@@ -378,7 +297,6 @@ fn revin_stats(x: &[f32]) -> (f32, f32) {
     (mean as f32, var.sqrt() as f32)
 }
 
-/// Extract non-overlapping patches from a sequence.
 fn patchify(x: &[f32], patch_len: usize, stride: usize, num_patches: usize) -> Vec<Vec<f32>> {
     (0..num_patches)
         .map(|i| {
@@ -391,29 +309,121 @@ fn patchify(x: &[f32], patch_len: usize, stride: usize, num_patches: usize) -> V
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// zsfm-core::Forecaster
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zsfm_gguf::{GGMLType, GGUFMetaValue, GGUFWriter};
 
-impl zsfm_core::Forecaster for MomentModel {
-    type Config = MomentConfig;
-
-    fn load(gguf_path: &Path, config: MomentConfig) -> Result<Self> {
-        MomentModel::load(gguf_path, config)
+    fn pseudo(n: usize, seed: u64) -> Vec<f32> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+            })
+            .collect()
     }
 
-    /// MOMENT is univariate-only and point-forecast-only; `mask` is unused.
-    fn forecast(
-        &self,
-        context: &[Vec<f32>],
-        _mask: &[Vec<bool>],
-        horizon: usize,
-    ) -> Result<zsfm_core::QuantileMatrix> {
-        anyhow::ensure!(
-            context.len() == 1,
-            "MomentModel only supports univariate forecasting (1 variate)"
+    fn tiny_config() -> MomentConfig {
+        MomentConfig {
+            d_model: 16,
+            n_layers: 1,
+            n_heads: 2,
+            head_dim: 8,
+            d_ff: 32,
+            seq_len: 8,
+            patch_len: 2,
+            patch_stride: 2,
+            num_patches: 4,
+            rel_attn_num_buckets: 8,
+            rel_attn_max_distance: 16,
+            layer_norm_eps: 1e-6,
+        }
+    }
+
+    fn put2(w: &mut GGUFWriter, name: &str, rows: usize, cols: usize, seed: &mut u64, scale: f32) {
+        *seed += 1;
+        let data: Vec<f32> = pseudo(rows * cols, *seed)
+            .iter()
+            .map(|v| v * scale)
+            .collect();
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        w.add_tensor(name, vec![cols as u64, rows as u64], GGMLType::F32, bytes);
+    }
+
+    fn put1(w: &mut GGUFWriter, name: &str, n: usize, seed: &mut u64) {
+        *seed += 1;
+        let bytes: Vec<u8> = pseudo(n, *seed)
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        w.add_tensor(name, vec![n as u64], GGMLType::F32, bytes);
+    }
+
+    fn put3(w: &mut GGUFWriter, name: &str, d0: usize, d1: usize, d2: usize, seed: &mut u64) {
+        *seed += 1;
+        let bytes: Vec<u8> = pseudo(d0 * d1 * d2, *seed)
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        w.add_tensor(
+            name,
+            vec![d2 as u64, d1 as u64, d0 as u64],
+            GGMLType::F32,
+            bytes,
         );
-        let point = MomentModel::forecast(self, &context[0], horizon)?;
-        Ok(vec![vec![point]])
+    }
+
+    #[test]
+    fn burn_forecast_golden() {
+        let dir = std::env::temp_dir().join(format!("moment-burn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf");
+        let mut w = GGUFWriter::new();
+        w.add_metadata(
+            "general.architecture",
+            GGUFMetaValue::String("moment".into()),
+        );
+        let mut seed = 500u64;
+        put2(&mut w, "patch_embed.weight", 16, 2, &mut seed, 0.3);
+        put3(&mut w, "pos_embed.pe", 1, 8, 16, &mut seed);
+        put1(&mut w, "mask_embed", 16, &mut seed);
+        put1(&mut w, "blk.0.attn_rel_bias.weight", 16, &mut seed);
+        for n in ["attn_q", "attn_k", "attn_v", "attn_o"] {
+            put2(&mut w, &format!("blk.0.{n}.weight"), 16, 16, &mut seed, 0.3);
+        }
+        put1(&mut w, "blk.0.attn_norm.weight", 16, &mut seed);
+        put2(&mut w, "blk.0.ffn_wi0.weight", 32, 16, &mut seed, 0.3);
+        put2(&mut w, "blk.0.ffn_wi1.weight", 32, 16, &mut seed, 0.3);
+        put2(&mut w, "blk.0.ffn_wo.weight", 16, 32, &mut seed, 0.3);
+        put1(&mut w, "blk.0.ffn_norm.weight", 16, &mut seed);
+        put1(&mut w, "norm_f.weight", 16, &mut seed);
+        put2(&mut w, "head.weight", 2, 16, &mut seed, 0.3);
+        put1(&mut w, "head.bias", 2, &mut seed);
+        let f = std::fs::File::create(&path).unwrap();
+        w.write_to(&mut std::io::BufWriter::new(f)).unwrap();
+
+        let cfg = tiny_config();
+        let burn = BurnMomentModel::load(&path, cfg).unwrap();
+        let ctx: Vec<f32> = (0..8).map(|i| 10.0 + 0.5 * i as f32).collect();
+        let t0 = std::time::Instant::now();
+        let a = burn.forecast(&ctx, 4).unwrap();
+        let burn_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let b = burn.forecast(&ctx, 4).unwrap();
+        assert_eq!(a.len(), 4);
+        assert!(a.iter().all(|v| v.is_finite()));
+        assert!(a.iter().any(|&v| v != 0.0));
+        assert_eq!(a, b, "forecast must be deterministic");
+        println!("moment synthetic: burn {burn_ms:.3}ms out={a:?}");
+        // Golden values recorded from the verified Burn port.
+        let golden: [f32; 4] = [9.266289, 10.292548, 9.2582655, 10.252379];
+        assert_eq!(a.len(), golden.len());
+        for (x, y) in a.iter().zip(golden.iter()) {
+            assert!((x - y).abs() < 1e-4, "golden drift: {x} vs {y}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

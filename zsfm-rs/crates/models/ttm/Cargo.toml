@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "TinyTimeMixer / TTM-R2 (IBM Granite) zero-shot time-series forecaster: GGUF conversion + candle MLP-mixer inference."
+description = "TinyTimeMixer / TTM-R2 (IBM Granite) zero-shot time-series forecaster: GGUF conversion + Burn MLP-mixer inference."
 
 [dependencies]
 anyhow.workspace = true
@@ -13,11 +13,8 @@ serde_json.workspace = true
 safetensors.workspace = true
 byteorder.workspace = true
 indicatif.workspace = true
-candle-core.workspace = true
-candle-nn.workspace = true
 burn.workspace = true
 zsfm-core.workspace = true
-zsfm-nn.workspace = true
 zsfm-gguf.workspace = true
 zsfm-hub.workspace = true
 zsfm-burn.workspace = true

@@ -74,7 +74,7 @@ pub fn convert(
         let n_elems: usize = py_shape.iter().product();
         let innermost = py_shape.last().copied().unwrap_or(1);
 
-        // Q8_0: candle requires the innermost dim (last Python dim, first GGUF dim) to be
+        // Q8_0: Q8_0 blocks need the innermost dim (last Python dim, first GGUF dim) to be
         // divisible by 32. When it isn't, fall back to F32 for that tensor (biases, 1-D
         // buffers like fourier frequencies / RoPE freqs / per_dim_scale, etc).
         let (dst_dtype, gguf_shape, tensor_data) =

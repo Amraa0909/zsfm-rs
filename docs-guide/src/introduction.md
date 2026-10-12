@@ -3,7 +3,7 @@
 `zsfm-rs` is a Rust workspace for running zero-shot forecasting and tabular foundation models locally, without Python. It has two halves — plus a cleanup helper:
 
 1. **Convert** — download a model's real weights from HuggingFace and turn them into a single self-contained [GGUF](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md) file.
-2. **Infer** — load that GGUF file and run zero-shot inference (a forecast, or a tabular classification/regression) via [candle](https://github.com/huggingface/candle), Hugging Face's Rust tensor library. No PyTorch, no Python runtime, one native binary.
+2. **Infer** — load that GGUF file and run zero-shot inference (a forecast, or a tabular classification/regression) via [Burn](https://github.com/tracel-ai/burn). No PyTorch, no Python runtime, one native binary.
 3. **Delete** — remove a model's cached `model-f32.gguf` + `config.json` (and optionally an output GGUF) to free disk (`zsfm chronos delete`).
 
 Everything is exposed through one CLI binary, `zsfm`, with a subcommand per model:

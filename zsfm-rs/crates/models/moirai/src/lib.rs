@@ -4,4 +4,4 @@ pub mod infer;
 pub mod tensor_map;
 
 pub use config::MoiraiConfig;
-pub use infer::MoiraiModel;
+pub use infer::BurnMoiraiModel;

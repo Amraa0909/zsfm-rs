@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "TiRex (NX-AI) zero-shot time-series forecaster: GGUF conversion + candle xLSTM inference with a raw-array SIMD decode loop."
+description = "TiRex (NX-AI) zero-shot time-series forecaster: GGUF conversion + Burn xLSTM inference with a raw-array SIMD decode loop."
 
 [dependencies]
 anyhow.workspace = true
@@ -12,12 +12,9 @@ serde.workspace = true
 serde_json.workspace = true
 byteorder.workspace = true
 indicatif.workspace = true
-candle-core.workspace = true
-candle-nn.workspace = true
 burn.workspace = true
 simdeez.workspace = true
 zsfm-core.workspace = true
-zsfm-nn.workspace = true
 zsfm-gguf.workspace = true
 zsfm-checkpoint.workspace = true
 zsfm-hub.workspace = true

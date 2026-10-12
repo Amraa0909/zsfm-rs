@@ -11,7 +11,7 @@ use zsfm_tabfm::convert::{convert, ConvertOptions};
 use zsfm_tabfm::ensemble;
 use zsfm_tabfm::ensemble::config_gen::NormMethod;
 use zsfm_tabfm::ensemble::orchestrate::{self, EnsembleParams};
-use zsfm_tabfm::TabFMModel;
+use zsfm_tabfm::infer::BurnTabFMModel;
 
 #[derive(Clone, ValueEnum)]
 pub enum TaskArg {
@@ -233,44 +233,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::InspectTensors { path } => crate::common::inspect_tensors(&path)?,
 
         Command::Infer { gguf, config } => {
-            if zsfm_burn::engine_from_env() == zsfm_burn::Engine::Burn {
-                return run_infer_burn(&gguf, &config).await;
-            }
-            let buf = zsfm_core::read_stdin_limited()?;
-            let req: serde_json::Value = serde_json::from_str(&buf).context("parse JSON input")?;
-
-            let x = zsfm_core::parse_matrix(&req["x"])?;
-            let y = parse_vec_f32(&req["y"])?;
-            let train_size = req["train_size"]
-                .as_u64()
-                .context("train_size must be a non-negative integer")?
-                as usize;
-            let cat_mask = if req.get("cat_mask").is_some() && !req["cat_mask"].is_null() {
-                Some(parse_vec_bool(&req["cat_mask"])?)
-            } else {
-                None
-            };
-            let d = req.get("d").and_then(|v| v.as_u64()).map(|v| v as usize);
-
-            let config_str = std::fs::read_to_string(&config)
-                .with_context(|| format!("read {}", config.display()))?;
-            let tc = TabFMConfig::from_json(&config_str).context("parse config.json")?;
-
-            eprintln!("Loading model from {} …", gguf.display());
-            let model = TabFMModel::builder(&gguf)
-                .config_from(&tc)
-                .build()
-                .context("load model")?;
-
-            eprintln!(
-                "Running predict ({} rows, train_size={train_size}) …",
-                x.len()
-            );
-            let out = model
-                .predict(&x, &y, train_size, cat_mask.as_deref(), d)
-                .context("predict")?;
-
-            println!("{}", predict_json(tc.is_classifier, &out)?);
+            run_infer_burn(&gguf, &config).await?;
         }
 
         Command::EnsemblePredict {
@@ -279,11 +242,6 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             threads,
             batch_size,
         } => {
-            if zsfm_burn::engine_from_env() == zsfm_burn::Engine::Burn {
-                anyhow::bail!(
-                    "tabfm ensemble on Burn is not ported yet (single-table Infer is); use --engine candle"
-                );
-            }
             let buf = zsfm_core::read_stdin_limited()?;
             let req: serde_json::Value = serde_json::from_str(&buf).context("parse JSON input")?;
 
@@ -358,10 +316,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             let tc = TabFMConfig::from_json(&config_str).context("parse config.json")?;
 
             eprintln!("Loading model from {} …", gguf.display());
-            let model = TabFMModel::builder(&gguf)
-                .config_from(&tc)
-                .build()
-                .context("load model")?;
+            let model = BurnTabFMModel::load(&gguf, &tc).context("load model")?;
 
             let params = EnsembleParams::default()
                 .with_n_estimators(n_estimators)
@@ -499,7 +454,7 @@ async fn run_infer_burn(
     gguf: &std::path::PathBuf,
     config: &std::path::PathBuf,
 ) -> anyhow::Result<()> {
-    use zsfm_tabfm::infer::burn::BurnTabFMModel;
+    use zsfm_tabfm::infer::BurnTabFMModel;
 
     let buf = zsfm_core::read_stdin_limited()?;
     let req: serde_json::Value = serde_json::from_str(&buf).context("parse JSON input")?;

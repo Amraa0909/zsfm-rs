@@ -13,7 +13,7 @@
       zsfm-gguf/        # GGUF reader/writer
       zsfm-checkpoint/  # loads safetensors/pickle/onnx/hdf5/npz/ckpt/gguf, dtype casting, recast()
       zsfm-hub/         # HuggingFace download + the canonical-F32-cache helpers
-      zsfm-nn/          # shared candle tensor primitives
+      zsfm-burn/        # shared Burn tensor ops + direct GGUF loading
       zsfm-bench/       # in-process rolling-window accuracy/latency benchmark + ensembling
       models/
         chronos/ flowstate/ moirai/ moirai2/ moment/ sundial/ timesfm/ toto/ ttm/
@@ -72,14 +72,14 @@ zsfm-bench report
 
 Roughly the shape to follow, based on the existing crates under `models/`:
 
-1. New crate under `crates/models/<name>/` with a weight-name mapping from the original checkpoint to whatever internal names you want, an inference module built on candle, and a request/response type. Put exact-match name pairs in a `TABLE` and look them up with `zsfm_gguf::map_with_table`; keep only prefix/layer rules as code (see `models/timesfm/src/tensor_map.rs`). Share norm/softmax/attention/RoPE via `zsfm_nn` instead of private copies.
+1. New crate under `crates/models/<name>/` with a weight-name mapping from the original checkpoint to whatever internal names you want, an inference module built on Burn, and a request/response type. Put exact-match name pairs in a `TABLE` and look them up with `zsfm_gguf::map_with_table`; keep only prefix/layer rules as code (see `models/timesfm/src/tensor_map.rs`). Share linear/norm/attention/RoPE via `zsfm_burn` instead of private copies.
 2. A `zsfm/src/<name>.rs` (`zsfm-rs/crates/zsfm/src/<name>.rs`) with `convert`/`infer`/`delete` subcommands, following the caching pattern described in [The `zsfm` CLI](./cli-overview.md#model-caching) — compute `zsfm_hub::canonical_gguf_path` (or `variant_gguf_path` for multi-task repos), check it via `zsfm_hub::try_recast_from_cache` before downloading, call `zsfm_checkpoint::recast` for the final dtype, use `crate::common::DtypeArg` (not a local copy), read stdin via `zsfm_core::read_stdin_limited`, parse horizon via `zsfm_core::parse_horizon`, and implement `delete` via `common::delete_cached_model`.
 3. Wire the subcommand into `zsfm`'s top-level `Commands` enum (`zsfm-rs/crates/zsfm/src/main.rs`). Look up the default repo in `zsfm_hub::MODEL_REPOS` so CLI and Python cannot drift.
 4. A page in this guide (`docs-guide/src/models/`) and a row in the relevant summary table.
 
 ## Platform notes
 
-- macOS links Apple's Accelerate via `candle` `accelerate` (enabled only in `crates/zsfm` + `zsfm-bench` for `cfg(target_os = "macos")`; other crates inherit it through feature unification when built as part of the binary). Linux/Windows use candle's portable backend — correct but 2-5x slower on GEMM. For native-CPU Linux builds, uncomment `target-cpu=native` in `.cargo/config.toml`.
+- macOS links Apple's Accelerate automatically where available. Linux/Windows use the portable CPU backend. For native-CPU Linux builds, uncomment `target-cpu=native` in `.cargo/config.toml`.
 - Windows builds: `cargo check` runs in CI (`windows-check` job). Full workspace needs `hdf5-metno` C build which often fails on MSVC; at minimum `zsfm-core`, `zsfm-gguf`, `zsfm-nn`, `zsfm-hub` check cleanly. No release artifact is published for Windows yet.
 - TiRex ships a `.ckpt` (not safetensors), so `zsfm-tirex` intentionally omits the `safetensors` dependency and goes through the generic checkpoint path.
 - Downloads stream with resume + `Content-Range` and byte-count checks, log SHA256, and write a `.size` sidecar to detect cache corruption. Full SHA256 verification against Hub metadata is not yet wired (Hub listing does not expose hashes); compare the logged hash with the Hub file page when debugging.

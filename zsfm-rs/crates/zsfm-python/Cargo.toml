@@ -37,7 +37,4 @@ zsfm-moirai.workspace = true
 zsfm-moirai2.workspace = true
 zsfm-flowstate.workspace = true
 zsfm-tirex.workspace = true
-# candle is pulled via the model crates; pyo3 bindings also need it for inference
-candle-core.workspace = true
-candle-nn.workspace = true
 tokio = { workspace = true }

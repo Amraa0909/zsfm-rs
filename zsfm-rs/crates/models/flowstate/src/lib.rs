@@ -4,4 +4,4 @@ pub mod infer;
 pub mod tensor_map;
 
 pub use config::FlowStateConfig;
-pub use infer::{FlowStateModel, FlowStateModelBuilder, InferConfig};
+pub use infer::{BurnFlowStateModel, InferConfig};

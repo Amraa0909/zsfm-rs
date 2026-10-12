@@ -4,7 +4,6 @@ members = [
     "crates/zsfm-gguf",
     "crates/zsfm-hub",
     "crates/zsfm-core",
-    "crates/zsfm-nn",
     "crates/zsfm-checkpoint",
     "crates/models/toto",
     "crates/models/tabfm",
@@ -42,7 +41,6 @@ rust-version = "1.82"
 zsfm-core = { path = "crates/zsfm-core", version = "0.2.7" }
 zsfm-gguf = { path = "crates/zsfm-gguf", version = "0.2.7" }
 zsfm-hub = { path = "crates/zsfm-hub", version = "0.2.7" }
-zsfm-nn = { path = "crates/zsfm-nn", version = "0.2.7" }
 zsfm-burn = { path = "crates/zsfm-burn", version = "0.2.7" }
 zsfm-checkpoint = { path = "crates/zsfm-checkpoint", version = "0.2.7" }
 zsfm-toto = { path = "crates/models/toto", version = "0.2.7" }
@@ -83,14 +81,8 @@ rayon = "1"
 simdeez = "3"
 csv = "1"
 thiserror = "1"
-# No "accelerate" feature here: it links Apple's Accelerate.framework and only
-# builds on macOS. `zsfm` (crates/zsfm) turns it on for macOS builds only (see
-# its Cargo.toml) via Cargo's feature unification, which every other crate in
-# the workspace picks up for free when built as part of the `zsfm` binary;
-# standalone `cargo test -p <model-crate>` runs still work everywhere via
-# candle's portable default backend.
-candle-core = "0.8"
-candle-nn = "0.8"
+# Portable CPU backend (Burn Flex). No Accelerate feature here: it links
+# Apple's Accelerate.framework and only builds on macOS.
 burn = { version = "0.22", features = ["flex"] }
 pyo3 = { version = "0.23", features = ["extension-module"] }
 numpy = "0.23"

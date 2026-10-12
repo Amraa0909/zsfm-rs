@@ -87,9 +87,9 @@ pub fn convert(
             let innermost = py_shape.last().copied().unwrap_or(1);
             let outermost = py_shape.first().copied().unwrap_or(1);
 
-            // Q8_0: candle requires the innermost dimension (last Python dim, first GGUF dim) to
+            // Q8_0: Q8_0 blocks need the innermost dimension (last Python dim, first GGUF dim) to
             // be divisible by 32. When that fails for a 2D weight with a block-aligned outermost
-            // dim, we transpose the data and flip the GGUF shape so candle sees the weight with
+            // dim, we transpose the data and flip the GGUF shape so the loader sees the weight with
             // the divisible dimension as innermost. The inference loader corrects the orientation.
             let (dst_dtype, gguf_shape, tensor_data) =
                 if opts.output_dtype == GGMLType::Q8_0 && innermost % 32 != 0 {
@@ -100,8 +100,9 @@ pub fn convert(
                         let transposed = transpose_f32(&f32_vals, outermost, innermost);
                         let qdata = quantize_q8_0(&transposed)
                             .with_context(|| format!("tensor {hf_name}: quantize failed"))?;
-                        // GGUF shape = Python shape order (NOT reversed). Candle reverses it back,
-                        // seeing (d_in, d_out) with last dim d_out divisible by 32.
+                        // GGUF shape = Python shape order (NOT reversed). The loader
+                        // un-reverses it back, seeing (d_in, d_out) with last dim
+                        // d_out divisible by 32.
                         let gs = py_shape.iter().map(|&d| d as u64).collect();
                         (GGMLType::Q8_0, gs, qdata)
                     } else {

@@ -1,10 +1,9 @@
 use std::time::Instant;
 
-/// One timed op comparison: candle time, Burn time, max abs error.
+/// One timed op measurement: Burn time plus max abs error vs the host reference.
 pub struct OpMeasurement {
     pub op: &'static str,
     pub shape: &'static str,
-    pub candle_ms: f64,
     pub burn_ms: f64,
     pub max_abs_err: f32,
 }
@@ -12,8 +11,8 @@ pub struct OpMeasurement {
 impl OpMeasurement {
     pub fn markdown_row(&self) -> String {
         format!(
-            "| {} | {} | {:.3} | {:.3} | {:.2e} |",
-            self.op, self.shape, self.candle_ms, self.burn_ms, self.max_abs_err
+            "| {} | {} | {:.3} | {:.2e} |",
+            self.op, self.shape, self.burn_ms, self.max_abs_err
         )
     }
 }

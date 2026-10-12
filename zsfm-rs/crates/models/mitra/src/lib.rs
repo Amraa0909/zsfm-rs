@@ -4,4 +4,4 @@ pub mod infer;
 pub mod tensor_map;
 
 pub use config::MitraConfig;
-pub use infer::MitraModel;
+pub use infer::BurnMitraModel;

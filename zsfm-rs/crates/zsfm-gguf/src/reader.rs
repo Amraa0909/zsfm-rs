@@ -1,10 +1,6 @@
 //! Minimal GGUF v2/v3 reader for the tensor types this crate's writer emits
-//! (F32, F16, BF16, Q8_0).
-//!
-//! candle's `gguf_file` reader covers many more quantization formats but does
-//! not know BF16 (ggml dtype 30), so BF16 files written here would otherwise be
-//! unreadable by our own tooling. Callers should prefer candle's reader and
-//! fall back to this one.
+//! (F32, F16, BF16, Q8_0), including BF16 (ggml dtype 30) which generic
+//! readers do not know.
 
 use std::io::{Read, Seek, SeekFrom};
 

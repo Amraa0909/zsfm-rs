@@ -4,4 +4,4 @@ pub mod infer;
 pub mod tensor_map;
 
 pub use config::TiRexConfig;
-pub use infer::TiRexModel;
+pub use infer::BurnTiRexModel;

@@ -8,7 +8,6 @@ use clap::Subcommand;
 use zsfm_gguf::GGMLType;
 use zsfm_tirex::config::TiRexConfig;
 use zsfm_tirex::convert::{convert, ConvertOptions};
-use zsfm_tirex::infer::TiRexModel;
 
 #[derive(Subcommand)]
 pub enum Command {
@@ -24,8 +23,8 @@ pub enum Command {
     },
     /// Download TiRex from HuggingFace and convert to GGUF.
     ///
-    /// Downloads model.ckpt and reads it directly via candle's pickle reader —
-    /// no Python or intermediate extraction step required.
+    /// Downloads model.ckpt and reads it directly via the in-workspace
+    /// pickle reader — no Python or intermediate extraction step required.
     ///
     /// The first conversion downloads the model and writes a canonical F32 GGUF to
     /// `<model_dir>/<owner>__<name>/model-f32.gguf`, deleting the downloaded .ckpt
@@ -136,42 +135,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::InspectTensors { path } => crate::common::inspect_tensors(&path)?,
 
         Command::Infer { gguf } => {
-            if zsfm_burn::engine_from_env() == zsfm_burn::Engine::Burn {
-                return run_infer_burn(&gguf).await;
-            }
-            let buf = zsfm_core::read_stdin_limited()?;
-            let req: serde_json::Value = serde_json::from_str(&buf).context("parse JSON input")?;
-            let contexts = zsfm_core::parse_mv_contexts(req["context"].clone())?;
-            let horizon = zsfm_core::parse_horizon(&req)?;
-            let config = TiRexConfig::default_from_ckpt();
-
-            eprintln!("Loading model from {} …", gguf.display());
-            let model = TiRexModel::load(&gguf, config.clone()).context("load model")?;
-
-            let mut fc_outputs = Vec::new();
-            let mut total_ctx = 0usize;
-            for raw_variates in &contexts {
-                anyhow::ensure!(
-                    raw_variates.len() == 1,
-                    "TiRex only supports univariate forecasting (1 variate per context)"
-                );
-                let ctx = &raw_variates[0];
-                anyhow::ensure!(!ctx.is_empty(), "context series must not be empty");
-                total_ctx += ctx.len();
-                let (quantiles, median) = model.forecast(ctx, horizon).context("forecast")?;
-                let mut q_map: BTreeMap<String, Vec<f32>> = BTreeMap::new();
-                for (i, q) in config.quantiles.iter().enumerate() {
-                    q_map.insert(format!("{q:.2}"), quantiles[i].clone());
-                }
-                fc_outputs.push(zsfm_core::ForecastOutput::Univariate {
-                    point: median,
-                    quantiles: q_map,
-                });
-            }
-            println!(
-                "{}",
-                zsfm_core::forecast_response_json("tirex", total_ctx, horizon, fc_outputs)?
-            );
+            return run_infer_burn(&gguf).await;
         }
     }
 
@@ -180,7 +144,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
 
 async fn run_infer_burn(gguf: &std::path::PathBuf) -> anyhow::Result<()> {
     use std::collections::BTreeMap;
-    use zsfm_tirex::infer::burn::BurnTiRexModel;
+    use zsfm_tirex::infer::BurnTiRexModel;
 
     let buf = zsfm_core::read_stdin_limited()?;
     let req: serde_json::Value = serde_json::from_str(&buf).context("parse JSON input")?;

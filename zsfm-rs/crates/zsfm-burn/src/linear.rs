@@ -3,21 +3,21 @@ use burn::tensor::Tensor;
 #[cfg(test)]
 use burn::tensor::{Device, TensorData};
 
-/// y = x @ w^T + b, matching `zsfm_nn::linear_bias` semantics.
+/// y = x @ w^T + b.
 /// `x`: [lead, d_in], `w`: [d_out, d_in], `b`: [d_out].
 pub fn burn_linear_bias(x: Tensor<2>, w: Tensor<2>, b: Tensor<1>) -> Tensor<2> {
     let y: Tensor<2> = x.matmul(w.transpose());
     y + b.unsqueeze_dim::<2>(0)
 }
 
-/// y = x @ w^T, matching `zsfm_nn::linear_nobias`.
+/// y = x @ w^T (no bias).
 pub fn burn_linear_nobias(x: Tensor<2>, w: Tensor<2>) -> Tensor<2> {
     x.matmul(w.transpose())
 }
 
 /// `y = x @ w^T + b` for rank-D input: flatten leading dims, apply
 /// [`burn_linear_bias`] or [`burn_linear_nobias`], restore shape with the
-/// last dim replaced by `w`'s output dim. Matches `zsfm_nn::linear`.
+/// last dim replaced by `w`'s output dim.
 pub fn burn_linear_nd<const D: usize>(
     x: Tensor<D>,
     w: Tensor<2>,

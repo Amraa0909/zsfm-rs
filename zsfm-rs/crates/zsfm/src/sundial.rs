@@ -8,7 +8,6 @@ use zsfm_core::ForecastOutput;
 use zsfm_gguf::GGMLType;
 use zsfm_sundial::config::SundialConfig;
 use zsfm_sundial::convert::{convert, ConvertOptions};
-use zsfm_sundial::infer::SundialModel;
 
 #[derive(Subcommand)]
 pub enum Command {
@@ -139,44 +138,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         }
 
         Command::Infer { gguf, steps } => {
-            if zsfm_burn::engine_from_env() == zsfm_burn::Engine::Burn {
-                return run_infer_burn(&gguf, steps).await;
-            }
-            let buf = zsfm_core::read_stdin_limited()?;
-            let req: serde_json::Value = serde_json::from_str(&buf).context("parse JSON input")?;
-            let contexts = zsfm_core::parse_mv_contexts(req["context"].clone())?;
-            let horizon = zsfm_core::parse_horizon(&req)?;
-
-            eprintln!("Loading model from {} …", gguf.display());
-            let mut builder = SundialModel::builder(&gguf);
-            if let Some(s) = steps {
-                builder = builder.steps(s as usize);
-            }
-            let model = builder.build().context("load model")?;
-            eprintln!("Model loaded.");
-
-            let mut fc_outputs = Vec::new();
-            let mut total_ctx = 0usize;
-            for raw_variates in &contexts {
-                anyhow::ensure!(
-                    raw_variates.len() == 1,
-                    "Sundial only supports univariate forecasting (1 variate per context)"
-                );
-                let ctx = &raw_variates[0];
-                anyhow::ensure!(!ctx.is_empty(), "context series must not be empty");
-                total_ctx += ctx.len();
-                eprintln!("Running forecast (context len = {}) …", ctx.len());
-                let raw = model.forecast(ctx, &candle_core::Device::Cpu)?;
-                let point: Vec<f32> = raw.into_iter().take(horizon).collect();
-                fc_outputs.push(ForecastOutput::Univariate {
-                    point,
-                    quantiles: Default::default(),
-                });
-            }
-            println!(
-                "{}",
-                zsfm_core::forecast_response_json("sundial", total_ctx, horizon, fc_outputs)?
-            );
+            return run_infer_burn(&gguf, steps).await;
         }
 
         Command::InspectTensors { path } => crate::common::inspect_tensors(&path)?,
@@ -185,7 +147,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
 }
 
 async fn run_infer_burn(gguf: &std::path::PathBuf, steps: Option<u32>) -> anyhow::Result<()> {
-    use zsfm_sundial::infer::burn::BurnSundialModel;
+    use zsfm_sundial::infer::BurnSundialModel;
 
     let buf = zsfm_core::read_stdin_limited()?;
     let req: serde_json::Value = serde_json::from_str(&buf).context("parse JSON input")?;

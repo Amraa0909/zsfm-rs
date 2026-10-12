@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Moirai-2.0-R-small (Salesforce) zero-shot time-series forecaster: GGUF conversion + candle KV-cached decoder inference."
+description = "Moirai-2.0-R-small (Salesforce) zero-shot time-series forecaster: GGUF conversion + Burn KV-cached decoder inference."
 
 [dependencies]
 anyhow.workspace = true
@@ -13,12 +13,9 @@ serde_json.workspace = true
 safetensors.workspace = true
 byteorder.workspace = true
 indicatif.workspace = true
-candle-core.workspace = true
-candle-nn.workspace = true
 burn.workspace = true
 rayon.workspace = true
 zsfm-core.workspace = true
-zsfm-nn.workspace = true
 zsfm-gguf.workspace = true
 zsfm-hub.workspace = true
 zsfm-burn.workspace = true

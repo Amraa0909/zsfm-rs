@@ -8,7 +8,6 @@ use zsfm_core::ForecastOutput;
 use zsfm_gguf::GGMLType;
 use zsfm_moment::config::MomentConfig;
 use zsfm_moment::convert::{convert, ConvertOptions};
-use zsfm_moment::infer::MomentModel;
 
 #[derive(Subcommand)]
 pub enum Command {
@@ -125,38 +124,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::InspectTensors { path } => crate::common::inspect_tensors(&path)?,
 
         Command::Infer { gguf } => {
-            if zsfm_burn::engine_from_env() == zsfm_burn::Engine::Burn {
-                return run_infer_burn(&gguf).await;
-            }
-            let buf = zsfm_core::read_stdin_limited()?;
-            let req: serde_json::Value = serde_json::from_str(&buf).context("parse JSON input")?;
-            let contexts = zsfm_core::parse_mv_contexts(req["context"].clone())?;
-            let horizon = zsfm_core::parse_horizon(&req)?;
-            let config = MomentConfig::default();
-
-            eprintln!("Loading model from {} …", gguf.display());
-            let model = MomentModel::load(&gguf, config).context("load model")?;
-
-            let mut fc_outputs = Vec::new();
-            let mut total_ctx = 0usize;
-            for raw_variates in &contexts {
-                anyhow::ensure!(
-                    raw_variates.len() == 1,
-                    "MOMENT only supports univariate forecasting (1 variate per context)"
-                );
-                let ctx = &raw_variates[0];
-                anyhow::ensure!(!ctx.is_empty(), "context series must not be empty");
-                total_ctx += ctx.len();
-                let point = model.forecast(ctx, horizon).context("forecast")?;
-                fc_outputs.push(ForecastOutput::Univariate {
-                    point,
-                    quantiles: Default::default(),
-                });
-            }
-            println!(
-                "{}",
-                zsfm_core::forecast_response_json("moment", total_ctx, horizon, fc_outputs)?
-            );
+            return run_infer_burn(&gguf).await;
         }
     }
 
@@ -164,7 +132,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
 }
 
 async fn run_infer_burn(gguf: &std::path::PathBuf) -> anyhow::Result<()> {
-    use zsfm_moment::infer::burn::BurnMomentModel;
+    use zsfm_moment::infer::BurnMomentModel;
 
     let buf = zsfm_core::read_stdin_limited()?;
     let req: serde_json::Value = serde_json::from_str(&buf).context("parse JSON input")?;

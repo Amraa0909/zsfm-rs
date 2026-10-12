@@ -1,7 +1,6 @@
 use burn::tensor::{activation, Tensor};
 
-/// Scaled dot-product attention with additive mask, matching
-/// `zsfm_nn::scaled_dot_product_attention`.
+/// Scaled dot-product attention with additive mask.
 /// `q/k/v`: [batch, heads, seq_q/kv, head_dim].
 pub fn burn_attention(
     q: Tensor<4>,

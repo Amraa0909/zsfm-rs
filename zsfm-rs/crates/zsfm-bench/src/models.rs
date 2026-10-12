@@ -1,27 +1,26 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use candle_core::Device;
 
 use zsfm_chronos::config::Chronos2Config;
-use zsfm_chronos::infer::ChronosModel;
+use zsfm_chronos::infer::BurnChronosModel;
 use zsfm_flowstate::config::FlowStateConfig;
-use zsfm_flowstate::infer::FlowStateModel;
+use zsfm_flowstate::infer::BurnFlowStateModel;
 use zsfm_lag_llama::config::LagLlamaConfig;
-use zsfm_lag_llama::infer::LagLlamaModel;
+use zsfm_lag_llama::infer::BurnLagLlamaModel;
 use zsfm_moirai::config::MoiraiConfig;
-use zsfm_moirai::infer::MoiraiModel;
+use zsfm_moirai::infer::BurnMoiraiModel;
 use zsfm_moirai2::config::Moirai2Config;
-use zsfm_moirai2::infer::Moirai2Model;
+use zsfm_moirai2::infer::BurnMoirai2Model;
 use zsfm_moment::config::MomentConfig;
-use zsfm_moment::infer::MomentModel;
-use zsfm_sundial::infer::SundialModel;
-use zsfm_timesfm::infer::TimesFMModel;
+use zsfm_moment::infer::BurnMomentModel;
+use zsfm_sundial::infer::BurnSundialModel;
+use zsfm_timesfm::infer::BurnTimesFMModel;
 use zsfm_tirex::config::TiRexConfig;
-use zsfm_tirex::infer::TiRexModel;
-use zsfm_toto::infer::TotoModel;
+use zsfm_tirex::infer::BurnTiRexModel;
+use zsfm_toto::infer::BurnTotoModel;
 use zsfm_ttm::config::TtmConfig;
-use zsfm_ttm::infer::TtmModel;
+use zsfm_ttm::infer::BurnTtmModel;
 
 /// Sundial's ODE step count — 10 Heun steps beats the 50-step default on both
 /// speed and MAE (see `benchmark/optimisation_log.md`).
@@ -157,17 +156,17 @@ pub struct PointResult {
 }
 
 pub enum LoadedModel {
-    Toto(TotoModel),
-    Chronos(ChronosModel),
-    TimesFM(TimesFMModel),
-    Sundial(SundialModel),
-    Ttm(TtmModel),
-    LagLlama(LagLlamaModel),
-    Moment(MomentModel),
-    Moirai(MoiraiModel),
-    Moirai2(Moirai2Model),
-    FlowState(FlowStateModel),
-    Tirex(TiRexModel),
+    Toto(BurnTotoModel),
+    Chronos(BurnChronosModel),
+    TimesFM(BurnTimesFMModel),
+    Sundial(BurnSundialModel),
+    Ttm(BurnTtmModel),
+    LagLlama(BurnLagLlamaModel),
+    Moment(BurnMomentModel),
+    Moirai(BurnMoiraiModel),
+    Moirai2(BurnMoirai2Model),
+    FlowState(BurnFlowStateModel),
+    Tirex(BurnTiRexModel),
 }
 
 fn mean_diff(hi: &[f32], lo: &[f32]) -> f32 {
@@ -214,11 +213,11 @@ impl LoadedModel {
                     .with_context(|| format!("read {}", config_path.display()))?;
                 let toto_config: serde_json::Value =
                     serde_json::from_str(&config_str).context("parse config.json")?;
-                let m = TotoModel::builder(&canonical)
-                    .config_json(&toto_config)
-                    .with_compute_f64(false)
-                    .build()
-                    .context("load toto model")?;
+                let m = BurnTotoModel::load(
+                    &canonical,
+                    zsfm_toto::infer::InferConfig::from_json_value(&toto_config),
+                )
+                .context("load toto model")?;
                 LoadedModel::Toto(m)
             }
             ModelId::Chronos => {
@@ -226,10 +225,11 @@ impl LoadedModel {
                     .with_context(|| format!("read {}", config_path.display()))?;
                 let c2_config =
                     Chronos2Config::from_json(&config_str).context("parse config.json")?;
-                let m = ChronosModel::builder(&canonical)
-                    .config_from(&c2_config)
-                    .build()
-                    .context("load chronos model")?;
+                let m = BurnChronosModel::load(
+                    &canonical,
+                    zsfm_chronos::infer::InferConfig::from(&c2_config),
+                )
+                .context("load chronos model")?;
                 LoadedModel::Chronos(m)
             }
             ModelId::FlowState => {
@@ -237,55 +237,51 @@ impl LoadedModel {
                     .with_context(|| format!("read {}", config_path.display()))?;
                 let fs_config =
                     FlowStateConfig::from_json(&config_str).context("parse config.json")?;
-                let m = FlowStateModel::builder(&canonical)
-                    .config_from(&fs_config)
-                    .build()
-                    .context("load flowstate model")?;
+                let m = BurnFlowStateModel::load(
+                    &canonical,
+                    zsfm_flowstate::infer::InferConfig::from(&fs_config),
+                )
+                .context("load flowstate model")?;
                 LoadedModel::FlowState(m)
             }
             ModelId::Ttm => {
                 let config_str = std::fs::read_to_string(&config_path)
                     .with_context(|| format!("read {}", config_path.display()))?;
                 let ttm_config = TtmConfig::from_json(&config_str).context("parse config.json")?;
-                let m = TtmModel::builder(&canonical)
-                    .config(ttm_config)
-                    .build()
-                    .context("load ttm model")?;
+                let m = BurnTtmModel::load(&canonical, ttm_config).context("load ttm model")?;
                 LoadedModel::Ttm(m)
             }
             ModelId::TimesFM => {
-                let m = TimesFMModel::load(&canonical).context("load timesfm model")?;
+                let m = BurnTimesFMModel::load(&canonical).context("load timesfm model")?;
                 LoadedModel::TimesFM(m)
             }
             ModelId::Sundial => {
-                let m = SundialModel::builder(&canonical)
-                    .steps(SUNDIAL_STEPS)
-                    .build()
+                let m = BurnSundialModel::load(&canonical, Some(SUNDIAL_STEPS))
                     .context("load sundial model")?;
                 LoadedModel::Sundial(m)
             }
             ModelId::LagLlama => {
-                let m = LagLlamaModel::load(&canonical, LagLlamaConfig::default_from_ckpt())
+                let m = BurnLagLlamaModel::load(&canonical, LagLlamaConfig::default_from_ckpt())
                     .context("load lag-llama model")?;
                 LoadedModel::LagLlama(m)
             }
             ModelId::Moment => {
-                let m = MomentModel::load(&canonical, MomentConfig::default())
+                let m = BurnMomentModel::load(&canonical, MomentConfig::default())
                     .context("load moment model")?;
                 LoadedModel::Moment(m)
             }
             ModelId::Moirai => {
-                let m = MoiraiModel::load(&canonical, MoiraiConfig::default())
+                let m = BurnMoiraiModel::load(&canonical, MoiraiConfig::default())
                     .context("load moirai model")?;
                 LoadedModel::Moirai(m)
             }
             ModelId::Moirai2 => {
-                let m = Moirai2Model::load(&canonical, Moirai2Config::default())
+                let m = BurnMoirai2Model::load(&canonical, Moirai2Config::default())
                     .context("load moirai2 model")?;
                 LoadedModel::Moirai2(m)
             }
             ModelId::Tirex => {
-                let m = TiRexModel::load(&canonical, TiRexConfig::default_from_ckpt())
+                let m = BurnTiRexModel::load(&canonical, TiRexConfig::default_from_ckpt())
                     .context("load tirex model")?;
                 LoadedModel::Tirex(m)
             }
@@ -302,7 +298,7 @@ impl LoadedModel {
     pub fn point_and_iqr(&self, ctx: &[f32], horizon: usize) -> Result<PointResult> {
         match self {
             LoadedModel::Toto(m) => {
-                let patch_size = m.config.patch_size();
+                let patch_size = m.patch_size();
                 let ctx_len = (ctx.len().min(TOTO_MAX_CTX) / patch_size) * patch_size;
                 anyhow::ensure!(
                     ctx_len > 0,
@@ -317,10 +313,10 @@ impl LoadedModel {
                 Ok(PointResult { point, iqr })
             }
             LoadedModel::Chronos(m) => {
-                let patch_size = m.config.patch_size();
-                let patch_stride = m.config.patch_stride();
-                let max_ctx = m.config.context_length();
-                let levels = m.config.quantiles().to_vec();
+                let patch_size = m.patch_size();
+                let patch_stride = m.patch_stride();
+                let max_ctx = m.context_length();
+                let levels = m.quantiles().to_vec();
                 let median_idx = find_level(&levels, 0.5).unwrap_or(levels.len() / 2);
                 let total_len = ctx.len();
                 let usable = total_len.min(max_ctx);
@@ -339,8 +335,8 @@ impl LoadedModel {
                 Ok(PointResult { point, iqr })
             }
             LoadedModel::FlowState(m) => {
-                let levels = m.config.quantiles().to_vec();
-                let median_idx = m.config.median_index();
+                let levels = m.quantiles().to_vec();
+                let median_idx = m.median_index();
                 let qmat = m.forecast(ctx, horizon)?; // [n_q][horizon]
                 let point = qmat[median_idx].clone();
                 let iqr = match (find_level(&levels, 0.10), find_level(&levels, 0.90)) {
@@ -369,7 +365,7 @@ impl LoadedModel {
                 Ok(PointResult { point: mean, iqr })
             }
             LoadedModel::Sundial(m) => {
-                let raw = m.forecast(ctx, &Device::Cpu)?;
+                let raw = m.forecast(ctx)?;
                 let point = raw.into_iter().take(horizon).collect();
                 Ok(PointResult { point, iqr: None })
             }

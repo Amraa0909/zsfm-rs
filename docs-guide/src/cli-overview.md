@@ -45,7 +45,7 @@ This applies to every model **except** TabICL and TabPFN-3, which don't have the
 
 ## Output dtype
 
-Most `convert` commands accept `--dtype f32|f16|q8`. `q8` (Q8_0 block quantization) roughly quarters file size; tensors too small for a 32-element block automatically fall back to F32 for that tensor rather than erroring. BF16 is available through the generic converter (next section) for interop with other GGUF consumers, but not through the per-model `--dtype` flag — candle's GGUF reader in this workspace can't load ggml dtype 30 (BF16) back in, so a BF16-converted file couldn't be used with this same crate's own `infer`.
+Most `convert` commands accept `--dtype f32|f16|q8`. `q8` (Q8_0 block quantization) roughly quarters file size; tensors too small for a 32-element block automatically fall back to F32 for that tensor rather than erroring. BF16 is available through the generic converter (next section) for interop with other GGUF consumers, but not through the per-model `--dtype` flag — the model loaders support F32/F16/Q8_0, so a BF16-converted file couldn't be used with this same crate's own `infer`.
 
 ## The generic converter
 

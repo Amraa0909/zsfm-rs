@@ -4,7 +4,6 @@ members = [
     "zsfm-rs/crates/zsfm-gguf",
     "zsfm-rs/crates/zsfm-hub",
     "zsfm-rs/crates/zsfm-core",
-    "zsfm-rs/crates/zsfm-nn",
     "zsfm-rs/crates/zsfm-checkpoint",
     "zsfm-rs/crates/models/toto",
     "zsfm-rs/crates/models/tabfm",
@@ -42,7 +41,6 @@ rust-version = "1.82"
 zsfm-core = { path = "zsfm-rs/crates/zsfm-core", version = "0.2.7" }
 zsfm-gguf = { path = "zsfm-rs/crates/zsfm-gguf", version = "0.2.7" }
 zsfm-hub = { path = "zsfm-rs/crates/zsfm-hub", version = "0.2.7" }
-zsfm-nn = { path = "zsfm-rs/crates/zsfm-nn", version = "0.2.7" }
 zsfm-burn = { path = "zsfm-rs/crates/zsfm-burn", version = "0.2.7" }
 zsfm-checkpoint = { path = "zsfm-rs/crates/zsfm-checkpoint", version = "0.2.7" }
 zsfm-toto = { path = "zsfm-rs/crates/models/toto", version = "0.2.7" }
@@ -83,8 +81,6 @@ rayon = "1"
 simdeez = "3"
 csv = "1"
 thiserror = "1"
-candle-core = "0.8"
-candle-nn = "0.8"
 burn = { version = "0.22", features = ["flex"] }
 pyo3 = { version = "0.23", features = ["extension-module"] }
 numpy = "0.23"

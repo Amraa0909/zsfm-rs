@@ -7,8 +7,8 @@ use clap::ValueEnum;
 use zsfm_checkpoint::{load_checkpoint, LoadOptions};
 use zsfm_gguf::GGMLType;
 
-/// Shared `--dtype` flag. BF16 is deliberately absent: candle 0.8's GGUF reader
-/// (used by every model's own `infer` loader) cannot parse ggml dtype 30, so a
+/// Shared `--dtype` flag. BF16 is deliberately absent: the in-workspace GGUF
+/// reader used by every model's own `infer` loader handles F32/F16/Q8_0, so a
 /// bf16 file would fail to load back through the same model's `infer` command.
 /// The format-agnostic `zsfm convert` path supports BF16 for other consumers.
 #[derive(Clone, Copy, Debug, ValueEnum)]

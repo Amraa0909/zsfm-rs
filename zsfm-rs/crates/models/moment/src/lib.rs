@@ -4,4 +4,4 @@ pub mod infer;
 pub mod tensor_map;
 
 pub use config::MomentConfig;
-pub use infer::MomentModel;
+pub use infer::BurnMomentModel;

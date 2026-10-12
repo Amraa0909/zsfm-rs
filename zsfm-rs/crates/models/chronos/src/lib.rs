@@ -4,4 +4,4 @@ pub mod infer;
 pub mod tensor_map;
 
 pub use config::Chronos2Config;
-pub use infer::{ChronosModel, ChronosModelBuilder, InferConfig};
+pub use infer::{BurnChronosModel, InferConfig};

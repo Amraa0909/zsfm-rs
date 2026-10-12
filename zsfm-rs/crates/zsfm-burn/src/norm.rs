@@ -2,7 +2,7 @@ use burn::tensor::{activation, Tensor};
 #[cfg(test)]
 use burn::tensor::{Device, TensorData};
 
-/// RMSNorm over the last dim, matching `zsfm_nn::rms_norm` with weight.
+/// RMSNorm over the last dim, with weight.
 pub fn burn_rms_norm(x: Tensor<2>, w: Tensor<1>, eps: f32) -> Tensor<2> {
     let mean_sq = x.clone().square().mean_dim(1);
     let rms = (mean_sq.add_scalar(eps)).sqrt();
@@ -10,7 +10,7 @@ pub fn burn_rms_norm(x: Tensor<2>, w: Tensor<1>, eps: f32) -> Tensor<2> {
     normed * w.unsqueeze_dim::<2>(0)
 }
 
-/// LayerNorm over the last dim, matching `zsfm_nn::layer_norm`.
+/// LayerNorm over the last dim, with weight and bias.
 pub fn burn_layer_norm(x: Tensor<2>, w: Tensor<1>, b: Tensor<1>, eps: f32) -> Tensor<2> {
     let mean = x.clone().mean_dim(1);
     let centered = x - mean;
@@ -25,8 +25,7 @@ pub fn burn_softmax_last_dim(x: Tensor<2>) -> Tensor<2> {
     activation::softmax(x, 1)
 }
 
-/// RMSNorm over the last dim for rank-D input. Matches `zsfm_nn::rms_norm`
-/// applied to higher-rank tensors.
+/// RMSNorm over the last dim for rank-D input.
 pub fn burn_rms_norm_nd<const D: usize>(x: Tensor<D>, w: Tensor<1>, eps: f32) -> Tensor<D> {
     let dims = x.dims();
     let last = dims[D - 1];
@@ -34,7 +33,7 @@ pub fn burn_rms_norm_nd<const D: usize>(x: Tensor<D>, w: Tensor<1>, eps: f32) ->
     burn_rms_norm(x.reshape([lead, last]), w, eps).reshape(dims)
 }
 
-/// LayerNorm over the last dim for rank-D input. Matches `zsfm_nn::layer_norm`.
+/// LayerNorm over the last dim for rank-D input.
 pub fn burn_layer_norm_nd<const D: usize>(
     x: Tensor<D>,
     w: Tensor<1>,

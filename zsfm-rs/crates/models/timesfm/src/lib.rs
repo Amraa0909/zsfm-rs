@@ -4,4 +4,4 @@ pub mod infer;
 pub mod tensor_map;
 
 pub use config::TimesFMConfig;
-pub use infer::TimesFMModel;
+pub use infer::BurnTimesFMModel;

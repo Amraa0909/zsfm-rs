@@ -6,7 +6,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::infer::TabFMModel;
+use crate::infer::BurnTabFMModel;
 
 use super::config_gen::MemberConfig;
 use super::orchestrate::{run_members_classification, run_members_regression, EnsembleParams};
@@ -60,7 +60,7 @@ fn select_rows<T: Clone>(rows: &[T], idx: &[usize]) -> Vec<T> {
 /// top oversubscribes rather than helping (the same class of issue Round 1 documented for thread
 /// count). Reverted; kept simple.
 pub fn run_oof_classification(
-    model: &TabFMModel,
+    model: &BurnTabFMModel,
     x_train_raw: &[Vec<Value>],
     y_train_codes: &[f64],
     cat_mask: &[bool],
@@ -100,7 +100,7 @@ pub fn run_oof_classification(
 
 /// Regression counterpart: `[member][original_train_row]` *scaled* OOF predictions.
 pub fn run_oof_regression(
-    model: &TabFMModel,
+    model: &BurnTabFMModel,
     x_train_raw: &[Vec<Value>],
     y_train_scaled: &[f64],
     cat_mask: &[bool],

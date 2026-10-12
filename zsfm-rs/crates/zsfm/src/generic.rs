@@ -319,8 +319,8 @@ pub fn run_inspect(args: InspectArgs) -> anyhow::Result<()> {
     if ext == "gguf" {
         let mut file = std::fs::File::open(&args.path)
             .with_context(|| format!("open {}", args.path.display()))?;
-        // Prefer the in-crate reader (knows BF16); fall back to candle for
-        // foreign quantization formats it doesn't cover.
+        // The in-workspace reader covers the dtypes this toolchain writes
+        // (F32/F16/BF16/Q8_0); anything else errors out below.
         {
             use std::io::Seek;
             if let Ok(gguf) = zsfm_gguf::GGUFFile::read(&mut file) {
@@ -357,41 +357,10 @@ pub fn run_inspect(args: InspectArgs) -> anyhow::Result<()> {
             }
             file.seek(std::io::SeekFrom::Start(0))?;
         }
-        let content =
-            candle_core::quantized::gguf_file::Content::read(&mut file).context("read GGUF")?;
-
-        println!("Metadata in {}:", args.path.display());
-        let mut keys: Vec<&String> = content.metadata.keys().collect();
-        keys.sort();
-        for key in keys {
-            println!("  {key:48} {:?}", content.metadata[key]);
-        }
-        println!("Tensors:");
-        let mut names: Vec<&String> = content.tensor_infos.keys().collect();
-        names.sort();
-        for name in &names {
-            let ti = &content.tensor_infos[name.as_str()];
-            println!("  {name:64} {:?} {:?}", ti.ggml_dtype, ti.shape);
-        }
-        if let Some(n) = args.values {
-            let device = candle_core::Device::Cpu;
-            for name in names {
-                if let Some(only) = &args.tensor {
-                    if *name != *only {
-                        continue;
-                    }
-                }
-                let qt = content.tensor(&mut file, name, &device)?;
-                let vals: Vec<f32> = qt
-                    .dequantize(&device)?
-                    .flatten_all()?
-                    .to_dtype(candle_core::DType::F32)?
-                    .to_vec1()?;
-                let shown: Vec<String> = vals.iter().take(n).map(|v| v.to_string()).collect();
-                println!("  {name} values[..{}]: [{}]", shown.len(), shown.join(", "));
-            }
-        }
-        return Ok(());
+        anyhow::bail!(
+            "cannot inspect {}: GGUF uses a quantization format outside F32/F16/BF16/Q8_0",
+            args.path.display()
+        );
     }
 
     let opts = LoadOptions {

@@ -60,7 +60,7 @@ cargo build --release -p zsfm --manifest-path zsfm-rs/Cargo.toml
 ./zsfm-rs/target/release/zsfm --help
 ```
 
-On macOS, the release profile links against Apple's Accelerate framework for faster BLAS operations automatically — no extra setup needed. On Linux/Windows it falls back to candle's portable default backend.
+On macOS, the release profile links against Apple's Accelerate framework for faster BLAS operations automatically — no extra setup needed. On Linux/Windows it falls back to the portable CPU backend.
 
 ## Verifying it works
 

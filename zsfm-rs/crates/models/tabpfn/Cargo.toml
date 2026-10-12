@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "TabPFN-3 (Prior-Labs/tabpfn_3) zero-shot tabular foundation model: GGUF conversion + candle in-context-learning inference (classification only; regression's bar-distribution head is out of scope). NON-COMMERCIAL WEIGHTS LICENSE: research/internal-use only, see the crate's module docs."
+description = "TabPFN-3 (Prior-Labs/tabpfn_3) zero-shot tabular foundation model: GGUF conversion + Burn in-context-learning inference (classification only; regression's bar-distribution head is out of scope). NON-COMMERCIAL WEIGHTS LICENSE: research/internal-use only, see the crate's module docs."
 
 [dependencies]
 anyhow.workspace = true
@@ -13,11 +13,8 @@ serde_json.workspace = true
 safetensors.workspace = true
 byteorder.workspace = true
 indicatif.workspace = true
-candle-core.workspace = true
-candle-nn.workspace = true
 burn.workspace = true
 zsfm-core.workspace = true
-zsfm-nn.workspace = true
 zsfm-gguf.workspace = true
 zsfm-hub.workspace = true
 zsfm-burn.workspace = true

@@ -1,24 +1,15 @@
-pub mod burn;
-pub(crate) mod rope;
+//! TimesFM 2.5 Burn-only inference engine (Burn backend, Flex CPU).
+//!
+//! Same RevIN running stats, tokenizer, prefill + KV-cached decode, RoPE,
+//! and denormalization, with weights loaded straight from GGUF via
+//! [`zsfm_burn::GgufWeights`]. Architecture constants mirror the model.
 
-use std::collections::HashMap;
-use std::io::{BufReader, Read, Seek};
 use std::path::Path;
-use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device, Tensor, D};
+use burn::tensor::{activation, Device, Tensor, TensorData};
+use zsfm_burn::{open_gguf_weights, GgufWeights};
 
-use rope::RopeCache;
-use zsfm_nn::{linear, load_weight, make_causal_mask};
-
-const NORM_EPS: f64 = 1e-6;
-const REVIN_TOL: f32 = 1e-6;
-
-// ---------------------------------------------------------------------------
-// Architecture constants (TimesFM 2.5 200M)
-// ---------------------------------------------------------------------------
 const D_MODEL: usize = 1280;
 const N_HEADS: usize = 16;
 const HEAD_DIM: usize = 80;
@@ -27,138 +18,166 @@ const INPUT_PATCH: usize = 32;
 const OUTPUT_PATCH: usize = 128;
 const N_OUTPUTS: usize = 10;
 const DECODE_IDX: usize = 5;
-const M_PATCHES: usize = OUTPUT_PATCH / INPUT_PATCH; // 4
+const M_PATCHES: usize = OUTPUT_PATCH / INPUT_PATCH;
 const ROPE_THETA: f64 = 10000.0;
-const MAX_SEQ: usize = 16384 / INPUT_PATCH + 256; // generous upper bound
+const MAX_SEQ: usize = 16384 / INPUT_PATCH + 256;
+const NORM_EPS: f32 = 1e-6;
+const REVIN_TOL: f32 = 1e-6;
 
-// ---------------------------------------------------------------------------
-// Weight structs
-// ---------------------------------------------------------------------------
-
-struct ResidualBlockW {
-    hidden_w: Tensor,
-    hidden_b: Option<Tensor>,
-    output_w: Tensor,
-    output_b: Option<Tensor>,
-    skip_w: Tensor,
-    skip_b: Option<Tensor>,
+fn device() -> Device {
+    Device::flex()
 }
 
-struct AttnW {
-    qkv_w: Tensor,       // [3*D_MODEL, D_MODEL]
-    out_w: Tensor,       // [D_MODEL, D_MODEL]
-    q_norm_w: Tensor,    // [HEAD_DIM]
-    k_norm_w: Tensor,    // [HEAD_DIM]
-    q_scale: Tensor,     // [HEAD_DIM] cached as Tensor to avoid alloc per attention forward
-    pre_norm_w: Tensor,  // [D_MODEL]
-    post_norm_w: Tensor, // [D_MODEL]
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
 }
 
-struct FfnW {
-    up_w: Tensor,        // [D_MODEL, D_MODEL]
-    down_w: Tensor,      // [D_MODEL, D_MODEL]
-    pre_norm_w: Tensor,  // [D_MODEL]
-    post_norm_w: Tensor, // [D_MODEL]
+fn load_v(weights: &GgufWeights, name: &str) -> Result<Tensor<1>> {
+    weights.load_1d(name)
 }
 
-struct BlockW {
-    attn: AttnW,
-    ffn: FfnW,
+fn load_w(weights: &GgufWeights, name: &str, expected_d_out: usize) -> Result<Tensor<2>> {
+    weights.load_weight_2d(name, expected_d_out)
 }
 
-/// TimesFM 2.5 200M's architecture is fixed (see the module-level `const`s above) — there is no
-/// `config.json` and hence no `InferConfig`/builder here, unlike every other model in the
-/// workspace. `TimesFMModel::load` takes just the GGUF path.
-pub struct TimesFMModel {
-    device: Device,
-    rope: RopeCache,
-    tokenizer: ResidualBlockW,
-    blocks: Vec<BlockW>,
-    out_point: ResidualBlockW,
-    causal_mask_cache: Mutex<HashMap<usize, Tensor>>,
+fn load_flat(weights: &GgufWeights, name: &str) -> Result<Vec<f32>> {
+    weights.load_flat(name)
 }
 
-// ---------------------------------------------------------------------------
-// GGUF loading helpers
-// ---------------------------------------------------------------------------
-
-fn load_tensor(
-    content: &gguf_file::Content,
-    reader: &mut (impl Read + Seek),
-    name: &str,
-    device: &Device,
-) -> Result<Tensor> {
-    zsfm_nn::load_tensor(content, reader, name, device, DType::F32)
+struct BurnResidualBlockW {
+    hidden_w: Tensor<2>,
+    hidden_b: Option<Tensor<1>>,
+    output_w: Tensor<2>,
+    output_b: Option<Tensor<1>>,
+    skip_w: Tensor<2>,
+    skip_b: Option<Tensor<1>>,
 }
 
-fn load_residual_block(
-    content: &gguf_file::Content,
-    reader: &mut (impl Read + Seek),
-    prefix: &str,
-    hidden_d_out: usize,
-    out_d_out: usize,
-    with_bias: bool,
-    device: &Device,
-) -> Result<ResidualBlockW> {
-    let hidden_w = load_weight(
-        content,
-        reader,
-        &format!("{prefix}.hidden.weight"),
-        hidden_d_out,
-        device,
-    )?;
-    let hidden_b = if with_bias {
-        Some(load_tensor(
-            content,
-            reader,
-            &format!("{prefix}.hidden.bias"),
-            device,
-        )?)
-    } else {
-        None
-    };
-    let output_w = load_weight(
-        content,
-        reader,
-        &format!("{prefix}.output.weight"),
-        out_d_out,
-        device,
-    )?;
-    let output_b = if with_bias {
-        Some(load_tensor(
-            content,
-            reader,
-            &format!("{prefix}.output.bias"),
-            device,
-        )?)
-    } else {
-        None
-    };
-    let skip_w = load_weight(
-        content,
-        reader,
-        &format!("{prefix}.skip.weight"),
-        out_d_out,
-        device,
-    )?;
-    let skip_b = if with_bias {
-        Some(load_tensor(
-            content,
-            reader,
-            &format!("{prefix}.skip.bias"),
-            device,
-        )?)
-    } else {
-        None
-    };
-    Ok(ResidualBlockW {
-        hidden_w,
-        hidden_b,
-        output_w,
-        output_b,
-        skip_w,
-        skip_b,
-    })
+struct BurnAttnW {
+    qkv_w: Tensor<2>,
+    out_w: Tensor<2>,
+    q_norm_w: Tensor<1>,
+    k_norm_w: Tensor<1>,
+    q_scale: Tensor<1>,
+    pre_norm_w: Tensor<1>,
+    post_norm_w: Tensor<1>,
+}
+
+struct BurnFfnW {
+    up_w: Tensor<2>,
+    down_w: Tensor<2>,
+    pre_norm_w: Tensor<1>,
+    post_norm_w: Tensor<1>,
+}
+
+struct BurnBlockW {
+    attn: BurnAttnW,
+    ffn: BurnFfnW,
+}
+
+pub struct BurnTimesFMModel {
+    tokenizer: BurnResidualBlockW,
+    blocks: Vec<BurnBlockW>,
+    out_point: BurnResidualBlockW,
+    rope: BurnRope,
+}
+
+struct BurnRope {
+    cos: Tensor<2>,
+    sin: Tensor<2>,
+    head_dim: usize,
+}
+
+impl BurnRope {
+    fn build(head_dim: usize, max_seq: usize, theta: f64) -> Self {
+        let dev = device();
+        let half = head_dim / 2;
+        let inv_freq: Vec<f64> = (0..half)
+            .map(|i| 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64))
+            .collect();
+        let mut cos = vec![0.0f32; max_seq * head_dim];
+        let mut sin = vec![0.0f32; max_seq * head_dim];
+        for p in 0..max_seq {
+            for i in 0..half {
+                let angle = (p as f64 * inv_freq[i]) as f32;
+                let (s, c) = angle.sin_cos();
+                cos[p * head_dim + i] = c;
+                cos[p * head_dim + half + i] = c;
+                sin[p * head_dim + i] = s;
+                sin[p * head_dim + half + i] = s;
+            }
+        }
+        Self {
+            cos: Tensor::<2>::from_data(TensorData::new(cos, [max_seq, head_dim]), &dev),
+            sin: Tensor::<2>::from_data(TensorData::new(sin, [max_seq, head_dim]), &dev),
+            head_dim,
+        }
+    }
+
+    /// Apply RoPE to x with shape [b, seq, n_heads, head_dim].
+    fn apply(&self, x: Tensor<4>, start_pos: usize) -> Tensor<4> {
+        let [b, seq, _h, hd] = x.dims();
+        let half = hd / 2;
+        let cos = self
+            .cos
+            .clone()
+            .narrow(0, start_pos, seq)
+            .unsqueeze_dim::<3>(0)
+            .unsqueeze_dim::<4>(2);
+        let sin = self
+            .sin
+            .clone()
+            .narrow(0, start_pos, seq)
+            .unsqueeze_dim::<3>(0)
+            .unsqueeze_dim::<4>(2);
+        let x1 = x.clone().narrow(3, 0, half);
+        let x2 = x.clone().narrow(3, half, half);
+        let cos1 = cos.clone().narrow(3, 0, half);
+        let sin1 = sin.clone().narrow(3, 0, half);
+        let _ = (b, self.head_dim);
+        let first = x1.clone() * cos1.clone() - x2.clone() * sin1.clone();
+        let second = x2 * cos1 + x1 * sin1;
+        Tensor::cat(vec![first, second], 3)
+    }
+}
+
+fn linear(x: Tensor<2>, w: Tensor<2>, b: Option<Tensor<1>>) -> Tensor<2> {
+    match b {
+        Some(bias) => zsfm_burn::linear::burn_linear_bias(x, w, bias),
+        None => zsfm_burn::linear::burn_linear_nobias(x, w),
+    }
+}
+
+fn linear_nd<const D: usize>(x: Tensor<D>, w: Tensor<2>, b: Option<Tensor<1>>) -> Tensor<D> {
+    let dims = x.dims();
+    let last = dims[D - 1];
+    let lead: usize = dims[..D - 1].iter().product();
+    let out_d = w.dims()[0];
+    let flat = x.reshape([lead, last]);
+    let y = linear(flat, w, b);
+    let mut out_dims = dims;
+    out_dims[D - 1] = out_d;
+    y.reshape(out_dims)
+}
+
+fn rms_norm_2d(x: Tensor<2>, w: Tensor<1>) -> Tensor<2> {
+    zsfm_burn::norm::burn_rms_norm(x, w, NORM_EPS)
+}
+
+fn rms_norm_nd<const D: usize>(x: Tensor<D>, w: Tensor<1>) -> Tensor<D> {
+    let dims = x.dims();
+    let last = dims[D - 1];
+    let lead: usize = dims[..D - 1].iter().product();
+    let y = zsfm_burn::norm::burn_rms_norm(x.reshape([lead, last]), w, NORM_EPS);
+    y.reshape(dims)
+}
+
+fn softmax_last<const D: usize>(x: Tensor<D>) -> Tensor<D> {
+    activation::softmax(x, D - 1)
+}
+
+fn silu<const D: usize>(x: Tensor<D>) -> Tensor<D> {
+    activation::silu(x)
 }
 
 fn softplus(x: f32) -> f32 {
@@ -170,110 +189,103 @@ fn softplus(x: f32) -> f32 {
 }
 
 fn compute_q_scale(raw: Vec<f32>) -> Vec<f32> {
-    let factor = 1.442695041f32 / (HEAD_DIM as f32).sqrt();
+    let factor = std::f32::consts::LOG2_E / (HEAD_DIM as f32).sqrt();
     raw.into_iter().map(|x| factor * softplus(x)).collect()
 }
 
-impl TimesFMModel {
+fn load_residual_block(
+    weights: &GgufWeights,
+    prefix: &str,
+    hidden_d_out: usize,
+    out_d_out: usize,
+    with_bias: bool,
+) -> Result<BurnResidualBlockW> {
+    let hidden_w = load_w(&weights, &format!("{prefix}.hidden.weight"), hidden_d_out)?;
+    let hidden_b = with_bias
+        .then(|| load_v(&weights, &format!("{prefix}.hidden.bias")))
+        .transpose()?;
+    let output_w = load_w(&weights, &format!("{prefix}.output.weight"), out_d_out)?;
+    let output_b = with_bias
+        .then(|| load_v(&weights, &format!("{prefix}.output.bias")))
+        .transpose()?;
+    let skip_w = load_w(&weights, &format!("{prefix}.skip.weight"), out_d_out)?;
+    let skip_b = with_bias
+        .then(|| load_v(&weights, &format!("{prefix}.skip.bias")))
+        .transpose()?;
+    Ok(BurnResidualBlockW {
+        hidden_w,
+        hidden_b,
+        output_w,
+        output_b,
+        skip_w,
+        skip_b,
+    })
+}
+
+fn forward_residual_block(x: Tensor<2>, w: &BurnResidualBlockW) -> Tensor<2> {
+    let h = silu(linear(x.clone(), w.hidden_w.clone(), w.hidden_b.clone()));
+    let out = linear(h, w.output_w.clone(), w.output_b.clone());
+    let skip = linear(x, w.skip_w.clone(), w.skip_b.clone());
+    out + skip
+}
+
+fn burn_causal_mask(n: usize) -> Tensor<4> {
+    let dev = device();
+    let data: Vec<f32> = (0..n)
+        .flat_map(|q| (0..n).map(move |k| if k <= q { 0.0f32 } else { f32::NEG_INFINITY }))
+        .collect();
+    Tensor::<2>::from_data(TensorData::new(data, [n, n]), &dev)
+        .unsqueeze_dim::<3>(0)
+        .unsqueeze_dim::<4>(0)
+}
+
+fn burn_decode_mask(new_len: usize, cache_len: usize) -> Tensor<4> {
+    let dev = device();
+    let total = cache_len + new_len;
+    let data: Vec<f32> = (0..new_len)
+        .flat_map(|q_rel| {
+            (0..total).map(move |k_abs| {
+                if k_abs <= cache_len + q_rel {
+                    0.0f32
+                } else {
+                    f32::NEG_INFINITY
+                }
+            })
+        })
+        .collect();
+    Tensor::<2>::from_data(TensorData::new(data, [new_len, total]), &dev)
+        .unsqueeze_dim::<3>(0)
+        .unsqueeze_dim::<4>(0)
+}
+
+impl BurnTimesFMModel {
     pub fn load(gguf_path: &Path) -> Result<Self> {
-        let device = Device::Cpu;
-        let file = std::fs::File::open(gguf_path)
+        let weights = open_gguf_weights(gguf_path)
             .with_context(|| format!("open {}", gguf_path.display()))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-        let content = gguf_file::Content::read(&mut reader).context("parse GGUF header")?;
 
-        // Tokenizer ResidualBlock: in=64, hidden=1280, out=1280, bias=true
-        let tokenizer = load_residual_block(
-            &content,
-            &mut reader,
-            "tokenizer",
-            D_MODEL,
-            D_MODEL,
-            true,
-            &device,
-        )?;
+        let tokenizer = load_residual_block(&weights, "tokenizer", D_MODEL, D_MODEL, true)?;
 
-        // 20 transformer blocks
         let mut blocks = Vec::with_capacity(N_LAYERS);
         for n in 0..N_LAYERS {
             let b = format!("blk.{n}");
-            let qkv_raw = load_weight(
-                &content,
-                &mut reader,
-                &format!("{b}.attn_qkv.weight"),
-                3 * D_MODEL,
-                &device,
-            )?;
-            let out_w = load_weight(
-                &content,
-                &mut reader,
-                &format!("{b}.attn_out.weight"),
-                D_MODEL,
-                &device,
-            )?;
-            let q_norm_w = load_tensor(
-                &content,
-                &mut reader,
-                &format!("{b}.attn_q_norm.weight"),
-                &device,
-            )?;
-            let k_norm_w = load_tensor(
-                &content,
-                &mut reader,
-                &format!("{b}.attn_k_norm.weight"),
-                &device,
-            )?;
-            let q_scale_raw = load_tensor(
-                &content,
-                &mut reader,
-                &format!("{b}.attn_q_scale.weight"),
-                &device,
-            )?
-            .to_vec1::<f32>()?;
-            let q_scale = Tensor::from_vec(compute_q_scale(q_scale_raw), (HEAD_DIM,), &device)?;
-            let pre_norm_w = load_tensor(
-                &content,
-                &mut reader,
-                &format!("{b}.pre_attn_norm.weight"),
-                &device,
-            )?;
-            let post_norm_w = load_tensor(
-                &content,
-                &mut reader,
-                &format!("{b}.post_attn_norm.weight"),
-                &device,
-            )?;
-
-            let up_w = load_weight(
-                &content,
-                &mut reader,
-                &format!("{b}.ffn_up.weight"),
-                D_MODEL,
-                &device,
-            )?;
-            let down_w = load_weight(
-                &content,
-                &mut reader,
-                &format!("{b}.ffn_down.weight"),
-                D_MODEL,
-                &device,
-            )?;
-            let pre_ff_norm_w = load_tensor(
-                &content,
-                &mut reader,
-                &format!("{b}.pre_ff_norm.weight"),
-                &device,
-            )?;
-            let post_ff_norm_w = load_tensor(
-                &content,
-                &mut reader,
-                &format!("{b}.post_ff_norm.weight"),
-                &device,
-            )?;
-
-            blocks.push(BlockW {
-                attn: AttnW {
-                    qkv_w: qkv_raw,
+            let qkv_w = load_w(&weights, &format!("{b}.attn_qkv.weight"), 3 * D_MODEL)?;
+            let out_w = load_w(&weights, &format!("{b}.attn_out.weight"), D_MODEL)?;
+            let q_norm_w = load_v(&weights, &format!("{b}.attn_q_norm.weight"))?;
+            let k_norm_w = load_v(&weights, &format!("{b}.attn_k_norm.weight"))?;
+            let q_scale_raw: Vec<f32> = load_flat(&weights, &format!("{b}.attn_q_scale.weight"))?;
+            let q_scale = Tensor::<1>::from_data(
+                TensorData::new(compute_q_scale(q_scale_raw), [HEAD_DIM]),
+                &device(),
+            );
+            let pre_norm_w = load_v(&weights, &format!("{b}.pre_attn_norm.weight"))?;
+            let post_norm_w = load_v(&weights, &format!("{b}.post_attn_norm.weight"))?;
+            let up_w = load_w(&weights, &format!("{b}.ffn_up.weight"), D_MODEL)?;
+            let down_w = load_w(&weights, &format!("{b}.ffn_down.weight"), D_MODEL)?;
+            let pre_ff = load_v(&weights, &format!("{b}.pre_ff_norm.weight"))?;
+            let post_ff = load_v(&weights, &format!("{b}.post_ff_norm.weight"))?;
+            blocks.push(BurnBlockW {
+                attn: BurnAttnW {
+                    qkv_w,
                     out_w,
                     q_norm_w,
                     k_norm_w,
@@ -281,53 +293,31 @@ impl TimesFMModel {
                     pre_norm_w,
                     post_norm_w,
                 },
-                ffn: FfnW {
+                ffn: BurnFfnW {
                     up_w,
                     down_w,
-                    pre_norm_w: pre_ff_norm_w,
-                    post_norm_w: post_ff_norm_w,
+                    pre_norm_w: pre_ff,
+                    post_norm_w: post_ff,
                 },
             });
         }
 
-        // Output projection (no bias, hidden=1280, out=1280)
-        let out_point = load_residual_block(
-            &content,
-            &mut reader,
-            "out_point",
-            D_MODEL,
-            D_MODEL,
-            false,
-            &device,
-        )?;
-
-        let rope = RopeCache::new(HEAD_DIM, MAX_SEQ, ROPE_THETA, &device)?;
-
+        let out_point = load_residual_block(&weights, "out_point", D_MODEL, D_MODEL, false)?;
+        let rope = BurnRope::build(HEAD_DIM, MAX_SEQ, ROPE_THETA);
         Ok(Self {
-            device,
-            rope,
             tokenizer,
             blocks,
             out_point,
-            causal_mask_cache: Mutex::new(HashMap::new()),
+            rope,
         })
     }
 
-    // -----------------------------------------------------------------------
-    // Public API
-    // -----------------------------------------------------------------------
-
-    /// Forecast a univariate time series.
-    ///
-    /// Returns `[N_OUTPUTS][prediction_length]` where index 0 is the point
-    /// forecast and indices 1-9 are quantile forecasts (q0.1 … q0.9).
     pub fn forecast(&self, context: &[f32], prediction_length: usize) -> Result<Vec<Vec<f32>>> {
         let p = INPUT_PATCH;
         let o = OUTPUT_PATCH;
         let q = N_OUTPUTS;
         let m = M_PATCHES;
 
-        // Pad front so len is divisible by p
         let len_front = if context.len() % p == 0 {
             0
         } else {
@@ -335,12 +325,10 @@ impl TimesFMModel {
         };
         let mut vals = vec![0.0f32; len_front + context.len()];
         vals[len_front..].copy_from_slice(context);
-        let mut mask = vec![true; len_front]; // True = masked (padding)
+        let mut mask = vec![true; len_front];
         mask.extend(vec![false; context.len()]);
-
         let n_ctx = (len_front + context.len()) / p;
 
-        // Compute cumulative running stats per patch
         let mut patch_mus = Vec::with_capacity(n_ctx);
         let mut patch_sigmas = Vec::with_capacity(n_ctx);
         let (mut rs_n, mut rs_mu, mut rs_sigma) = (0.0f32, 0.0f32, 0.0f32);
@@ -352,11 +340,8 @@ impl TimesFMModel {
             patch_sigmas.push(rs_sigma);
         }
         let (last_n, last_mu, last_sigma) = (rs_n, rs_mu, rs_sigma);
-
-        // Build normalized tokenizer input for context patches
         let ctx_input = build_tokenizer_input(&vals, &mask, n_ctx, p, &patch_mus, &patch_sigmas);
 
-        // Prefill: full forward pass collecting per-layer KV cache
         let num_decode_steps = if prediction_length <= o {
             0
         } else {
@@ -365,11 +350,14 @@ impl TimesFMModel {
         let total_steps = 1 + num_decode_steps;
         let mut all_outputs: Vec<Vec<[f32; N_OUTPUTS]>> = Vec::with_capacity(total_steps);
 
-        let (ctx_out, mut kv_cache) = self.prefill(&ctx_input, n_ctx)?;
-        let ctx_denorm = denorm_flat(&ctx_out, &patch_mus, &patch_sigmas, o, q)?;
+        let (ctx_out, mut kv_cache) = self.prefill(ctx_input, n_ctx);
+        let ctx_flat: Vec<f32> = ctx_out
+            .to_data()
+            .try_to_vec()
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let ctx_denorm = denorm_flat(&ctx_flat, &patch_mus, &patch_sigmas, o, q);
         all_outputs.push(ctx_denorm[n_ctx - 1].clone());
 
-        // AR decode: process M_PATCHES=4 new patches per step with cached K/V
         let (mut ar_n, mut ar_mu, mut ar_sigma) = (last_n, last_mu, last_sigma);
         let mut last_ar: Vec<f32> = ctx_denorm[n_ctx - 1]
             .iter()
@@ -379,7 +367,6 @@ impl TimesFMModel {
         for step in 0..num_decode_steps {
             let new_vals_flat = last_ar.clone();
             let new_mask_flat = vec![false; o];
-
             let mut new_mus = Vec::with_capacity(m);
             let mut new_sigmas = Vec::with_capacity(m);
             for mi in 0..m {
@@ -389,19 +376,20 @@ impl TimesFMModel {
                 new_mus.push(ar_mu);
                 new_sigmas.push(ar_sigma);
             }
-
             let new_input =
                 build_tokenizer_input(&new_vals_flat, &new_mask_flat, m, p, &new_mus, &new_sigmas);
             let rope_offset = n_ctx + m * step;
-            let new_out = self.decode_chunk(&new_input, &mut kv_cache, rope_offset)?;
-            let last_m_denorm = denorm_flat(&new_out, &new_mus, &new_sigmas, o, q)?;
-
+            let new_out = self.decode_chunk(new_input, &mut kv_cache, rope_offset);
+            let new_flat: Vec<f32> = new_out
+                .to_data()
+                .try_to_vec()
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let last_m_denorm = denorm_flat(&new_flat, &new_mus, &new_sigmas, o, q);
             let step_out = &last_m_denorm[m - 1];
             last_ar = step_out.iter().map(|row| row[DECODE_IDX]).collect();
             all_outputs.push(step_out.clone());
         }
 
-        // Assemble [N_OUTPUTS][prediction_length]
         let total_available = all_outputs.len() * o;
         let n_take = prediction_length.min(total_available);
         let mut result: Vec<Vec<f32>> = vec![Vec::with_capacity(n_take); q];
@@ -418,234 +406,186 @@ impl TimesFMModel {
         Ok(result)
     }
 
-    // -----------------------------------------------------------------------
-    // Prefill: full forward + collect per-layer KV cache
-    // KV tensors stored as [1, N_HEADS, n_patches, HEAD_DIM]
-    // -----------------------------------------------------------------------
-
     fn prefill(
         &self,
-        tokenizer_input: &Tensor, // [n_patches, 2*INPUT_PATCH]
+        tokenizer_input: Tensor<2>,
         n_patches: usize,
-    ) -> Result<(Tensor, Vec<(Tensor, Tensor)>)> {
-        let x = forward_residual_block(tokenizer_input, &self.tokenizer, true)?;
-        let mut hidden = x.unsqueeze(0)?;
-        let causal = {
-            let mut cache = self
-                .causal_mask_cache
-                .lock()
-                .map_err(|_| anyhow::anyhow!("cache mutex poisoned"))?;
-            if !cache.contains_key(&n_patches) {
-                cache.insert(n_patches, make_causal_mask(n_patches, 0, &self.device)?);
-            }
-            cache[&n_patches].clone()
-        };
-        let mut kv_cache: Vec<(Tensor, Tensor)> = Vec::with_capacity(N_LAYERS);
+    ) -> (Tensor<2>, Vec<(Tensor<4>, Tensor<4>)>) {
+        let x = forward_residual_block(tokenizer_input, &self.tokenizer);
+        let mut hidden = x.unsqueeze_dim::<3>(0);
+        let causal = burn_causal_mask(n_patches);
+        let mut kv_cache = Vec::with_capacity(N_LAYERS);
         for block in &self.blocks {
-            let (h_out, k, v) = self.prefill_block(hidden, block, n_patches, &causal)?;
+            let (h_out, k, v) = self.prefill_block(hidden, block, n_patches, causal.clone());
             hidden = h_out;
             kv_cache.push((k, v));
         }
-        let out_seq = hidden.squeeze(0)?;
-        let out = forward_residual_block(&out_seq, &self.out_point, false)?;
-        Ok((out, kv_cache))
+        let out_seq: Tensor<2> = hidden.squeeze_dim(0);
+        let out = forward_residual_block(out_seq, &self.out_point);
+        (out, kv_cache)
     }
 
     fn prefill_block(
         &self,
-        x: Tensor,
-        w: &BlockW,
+        x: Tensor<3>,
+        w: &BurnBlockW,
         n_patches: usize,
-        causal: &Tensor,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        let normed = rms_norm(&x, &w.attn.pre_norm_w, NORM_EPS)?;
-        let (attn_out, k, v) = self.prefill_attn(normed, &w.attn, n_patches, causal)?;
-        let attn_out = (rms_norm(&attn_out, &w.attn.post_norm_w, NORM_EPS)? + &x)?;
-        let normed_ff = rms_norm(&attn_out, &w.ffn.pre_norm_w, NORM_EPS)?;
-        let ff_out = self.forward_ffn(normed_ff, &w.ffn)?;
-        let out = (rms_norm(&ff_out, &w.ffn.post_norm_w, NORM_EPS)? + &attn_out)?;
-        Ok((out, k, v))
+        causal: Tensor<4>,
+    ) -> (Tensor<3>, Tensor<4>, Tensor<4>) {
+        let normed = rms_norm_nd(x.clone(), w.attn.pre_norm_w.clone());
+        let (attn_out, k, v) = self.prefill_attn(normed, &w.attn, n_patches, causal);
+        let attn_out = rms_norm_nd(attn_out, w.attn.post_norm_w.clone()) + x;
+        let normed_ff = rms_norm_nd(attn_out.clone(), w.ffn.pre_norm_w.clone());
+        let ff_out = self.forward_ffn(normed_ff, &w.ffn);
+        let out = rms_norm_nd(ff_out, w.ffn.post_norm_w.clone()) + attn_out;
+        (out, k, v)
     }
 
     fn prefill_attn(
         &self,
-        x: Tensor, // [1, n_patches, D_MODEL] pre-normed
-        w: &AttnW,
+        x: Tensor<3>,
+        w: &BurnAttnW,
         n_patches: usize,
-        causal: &Tensor,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        // (output, K, V) K/V: [1,N_HEADS,n,HEAD_DIM]
-        let qkv = linear(&x, &w.qkv_w, None)?;
-        let q = qkv.narrow(D::Minus1, 0, D_MODEL)?;
-        let k = qkv.narrow(D::Minus1, D_MODEL, D_MODEL)?;
-        let v = qkv.narrow(D::Minus1, 2 * D_MODEL, D_MODEL)?;
-
-        let q = q.reshape((1, n_patches, N_HEADS, HEAD_DIM))?;
-        let k = k.reshape((1, n_patches, N_HEADS, HEAD_DIM))?;
-        let v = v.reshape((1, n_patches, N_HEADS, HEAD_DIM))?;
-
-        let q = self.rope.apply(&q, 0)?;
-        let k = self.rope.apply(&k, 0)?;
-        let q = rms_norm(&q, &w.q_norm_w, NORM_EPS)?;
-        let k = rms_norm(&k, &w.k_norm_w, NORM_EPS)?;
-
-        let q = q.broadcast_mul(&w.q_scale)?;
-
-        let q = q.permute([0, 2, 1, 3])?.contiguous()?; // [1, N_HEADS, n, HEAD_DIM]
-        let k = k.permute([0, 2, 1, 3])?.contiguous()?;
-        let v = v.permute([0, 2, 1, 3])?.contiguous()?;
-
-        let scores = q.matmul(&k.transpose(D::Minus1, D::Minus2)?)?;
-        let scores = scores.broadcast_add(causal)?;
-        let attn_w = candle_nn::ops::softmax(&scores, D::Minus1)?;
-        let ctx = attn_w.matmul(&v)?;
-        let ctx = ctx
-            .permute([0, 2, 1, 3])?
-            .contiguous()?
-            .reshape((1, n_patches, D_MODEL))?;
-        Ok((linear(&ctx, &w.out_w, None)?, k, v))
+        causal: Tensor<4>,
+    ) -> (Tensor<3>, Tensor<4>, Tensor<4>) {
+        burn_prefill_attn(x, w, &self.rope, n_patches, causal)
     }
-
-    // -----------------------------------------------------------------------
-    // KV-cached decode: process M_PATCHES new patches, append to cache
-    // -----------------------------------------------------------------------
 
     fn decode_chunk(
         &self,
-        new_input: &Tensor,                   // [M_PATCHES, 2*INPUT_PATCH]
-        kv_cache: &mut Vec<(Tensor, Tensor)>, // mutated: K/V grow by M_PATCHES per call
-        rope_offset: usize,                   // = n_ctx + M_PATCHES * step
-    ) -> Result<Tensor> {
-        // → [M_PATCHES, D_MODEL]
-        let x = forward_residual_block(new_input, &self.tokenizer, true)?;
-        let mut hidden = x.unsqueeze(0)?;
+        new_input: Tensor<2>,
+        kv_cache: &mut Vec<(Tensor<4>, Tensor<4>)>,
+        rope_offset: usize,
+    ) -> Tensor<2> {
+        let x = forward_residual_block(new_input, &self.tokenizer);
+        let mut hidden = x.unsqueeze_dim::<3>(0);
         let cached_len = rope_offset;
-        let decode_mask = make_decode_mask(M_PATCHES, cached_len, &self.device)?;
+        let decode_mask = burn_decode_mask(M_PATCHES, cached_len);
         for (li, block) in self.blocks.iter().enumerate() {
-            // decode_block_kv returns the extended K/V (old cache + new M_PATCHES).
-            // Store directly — no second Tensor::cat needed.
-            let (h_out, k_new, v_new) =
-                self.decode_block_kv(hidden, block, &kv_cache[li], rope_offset, &decode_mask)?;
+            let (h_out, k_new, v_new) = self.decode_block_kv(
+                hidden,
+                block,
+                &kv_cache[li],
+                rope_offset,
+                decode_mask.clone(),
+            );
             hidden = h_out;
             kv_cache[li] = (k_new, v_new);
         }
-        let out_seq = hidden.squeeze(0)?;
-        forward_residual_block(&out_seq, &self.out_point, false)
+        let out_seq: Tensor<2> = hidden.squeeze_dim(0);
+        forward_residual_block(out_seq, &self.out_point)
     }
 
     fn decode_block_kv(
         &self,
-        x: Tensor,
-        w: &BlockW,
-        cache: &(Tensor, Tensor),
+        x: Tensor<3>,
+        w: &BurnBlockW,
+        cache: &(Tensor<4>, Tensor<4>),
         rope_offset: usize,
-        decode_mask: &Tensor,
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        let normed = rms_norm(&x, &w.attn.pre_norm_w, NORM_EPS)?;
+        decode_mask: Tensor<4>,
+    ) -> (Tensor<3>, Tensor<4>, Tensor<4>) {
+        let normed = rms_norm_nd(x.clone(), w.attn.pre_norm_w.clone());
         let (attn_out, k_new, v_new) =
-            self.decode_attn_kv(normed, &w.attn, cache, rope_offset, decode_mask)?;
-        let attn_out = (rms_norm(&attn_out, &w.attn.post_norm_w, NORM_EPS)? + &x)?;
-        let normed_ff = rms_norm(&attn_out, &w.ffn.pre_norm_w, NORM_EPS)?;
-        let ff_out = self.forward_ffn(normed_ff, &w.ffn)?;
-        let out = (rms_norm(&ff_out, &w.ffn.post_norm_w, NORM_EPS)? + &attn_out)?;
-        Ok((out, k_new, v_new))
+            self.decode_attn_kv(normed, &w.attn, cache, rope_offset, decode_mask);
+        let attn_out = rms_norm_nd(attn_out, w.attn.post_norm_w.clone()) + x;
+        let normed_ff = rms_norm_nd(attn_out.clone(), w.ffn.pre_norm_w.clone());
+        let ff_out = self.forward_ffn(normed_ff, &w.ffn);
+        let out = rms_norm_nd(ff_out, w.ffn.post_norm_w.clone()) + attn_out;
+        (out, k_new, v_new)
     }
 
     fn decode_attn_kv(
         &self,
-        x: Tensor, // [1, M_PATCHES, D_MODEL] pre-normed
-        w: &AttnW,
-        cache: &(Tensor, Tensor), // ([1,N_HEADS,cached,HEAD_DIM], same)
+        x: Tensor<3>,
+        w: &BurnAttnW,
+        cache: &(Tensor<4>, Tensor<4>),
         rope_offset: usize,
-        mask: &Tensor, // [1,1,M_PATCHES,cached+M_PATCHES]
-    ) -> Result<(Tensor, Tensor, Tensor)> {
-        // (output, K_new, V_new)
-        let qkv = linear(&x, &w.qkv_w, None)?;
-        let q = qkv.narrow(D::Minus1, 0, D_MODEL)?;
-        let k = qkv.narrow(D::Minus1, D_MODEL, D_MODEL)?;
-        let v = qkv.narrow(D::Minus1, 2 * D_MODEL, D_MODEL)?;
-
-        let q = q.reshape((1, M_PATCHES, N_HEADS, HEAD_DIM))?;
-        let k = k.reshape((1, M_PATCHES, N_HEADS, HEAD_DIM))?;
-        let v = v.reshape((1, M_PATCHES, N_HEADS, HEAD_DIM))?;
-
-        let q = self.rope.apply(&q, rope_offset)?;
-        let k = self.rope.apply(&k, rope_offset)?;
-        let q = rms_norm(&q, &w.q_norm_w, NORM_EPS)?;
-        let k = rms_norm(&k, &w.k_norm_w, NORM_EPS)?;
-
-        let q = q.broadcast_mul(&w.q_scale)?;
-
-        let q = q.permute([0, 2, 1, 3])?.contiguous()?; // [1, N_HEADS, M, HEAD_DIM]
-        let k = k.permute([0, 2, 1, 3])?.contiguous()?;
-        let v = v.permute([0, 2, 1, 3])?.contiguous()?;
-
-        // Extend cache: [1, N_HEADS, cached+M, HEAD_DIM].
-        // Return k_full/v_full so the caller can store them directly without a second cat.
-        let k_full = Tensor::cat(&[&cache.0, &k], 2)?;
-        let v_full = Tensor::cat(&[&cache.1, &v], 2)?;
-
-        let scores = q.matmul(&k_full.transpose(D::Minus1, D::Minus2)?)?;
-        let scores = scores.broadcast_add(mask)?;
-        let attn_w = candle_nn::ops::softmax(&scores, D::Minus1)?;
-        let ctx = attn_w.matmul(&v_full)?;
-        let ctx = ctx
-            .permute([0, 2, 1, 3])?
-            .contiguous()?
-            .reshape((1, M_PATCHES, D_MODEL))?;
-        Ok((linear(&ctx, &w.out_w, None)?, k_full, v_full))
+        mask: Tensor<4>,
+    ) -> (Tensor<3>, Tensor<4>, Tensor<4>) {
+        burn_decode_attn(x, w, &self.rope, cache, rope_offset, mask)
     }
 
-    fn forward_ffn(&self, x: Tensor, w: &FfnW) -> Result<Tensor> {
-        let h = linear(&x, &w.up_w, None)?;
-        let h = candle_nn::ops::silu(&h)?;
-        linear(&h, &w.down_w, None)
+    fn forward_ffn(&self, x: Tensor<3>, w: &BurnFfnW) -> Tensor<3> {
+        let h = linear_nd(x, w.up_w.clone(), None);
+        let h = silu(h);
+        linear_nd(h, w.down_w.clone(), None)
     }
 }
 
-// ---------------------------------------------------------------------------
-// ResidualBlock forward (tokenizer has bias, output projections do not)
-// ---------------------------------------------------------------------------
-
-fn forward_residual_block(x: &Tensor, w: &ResidualBlockW, _has_bias: bool) -> Result<Tensor> {
-    let h = linear(x, &w.hidden_w, w.hidden_b.as_ref())?;
-    let h = candle_nn::ops::silu(&h)?;
-    let out = linear(&h, &w.output_w, w.output_b.as_ref())?;
-    let skip = linear(x, &w.skip_w, w.skip_b.as_ref())?;
-    Ok((out + skip)?)
+fn burn_prefill_attn(
+    x: Tensor<3>,
+    w: &BurnAttnW,
+    rope: &BurnRope,
+    n_patches: usize,
+    causal: Tensor<4>,
+) -> (Tensor<3>, Tensor<4>, Tensor<4>) {
+    let qkv = linear_nd(x, w.qkv_w.clone(), None);
+    let q: Tensor<3> = qkv.clone().narrow(2, 0, D_MODEL);
+    let k: Tensor<3> = qkv.clone().narrow(2, D_MODEL, D_MODEL);
+    let v: Tensor<3> = qkv.narrow(2, 2 * D_MODEL, D_MODEL);
+    let q: Tensor<4> = q.reshape([1, n_patches, N_HEADS, HEAD_DIM]);
+    let k: Tensor<4> = k.reshape([1, n_patches, N_HEADS, HEAD_DIM]);
+    let v: Tensor<4> = v.reshape([1, n_patches, N_HEADS, HEAD_DIM]);
+    let q = rope.apply(q, 0);
+    let k = rope.apply(k, 0);
+    let q = rms_norm_nd(q, w.q_norm_w.clone());
+    let k = rms_norm_nd(k, w.k_norm_w.clone());
+    let scale = w
+        .q_scale
+        .clone()
+        .unsqueeze_dim::<2>(0)
+        .unsqueeze_dim::<3>(0)
+        .unsqueeze_dim::<4>(0);
+    let q = q * scale;
+    let q: Tensor<4> = q.permute([0, 2, 1, 3]);
+    let k: Tensor<4> = k.permute([0, 2, 1, 3]);
+    let v: Tensor<4> = v.permute([0, 2, 1, 3]);
+    let scores = q.clone().matmul(k.clone().transpose()) + causal;
+    let attn_w = softmax_last(scores);
+    let ctx = attn_w.matmul(v.clone());
+    let ctx: Tensor<4> = ctx.permute([0, 2, 1, 3]);
+    let ctx: Tensor<3> = ctx.reshape([1, n_patches, D_MODEL]);
+    (linear_nd(ctx, w.out_w.clone(), None), k, v)
 }
 
-// ---------------------------------------------------------------------------
-// Primitive ops
-// ---------------------------------------------------------------------------
-
-fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
-    zsfm_nn::rms_norm(x, Some(weight), eps)
+fn burn_decode_attn(
+    x: Tensor<3>,
+    w: &BurnAttnW,
+    rope: &BurnRope,
+    cache: &(Tensor<4>, Tensor<4>),
+    rope_offset: usize,
+    mask: Tensor<4>,
+) -> (Tensor<3>, Tensor<4>, Tensor<4>) {
+    let qkv = linear_nd(x, w.qkv_w.clone(), None);
+    let q: Tensor<3> = qkv.clone().narrow(2, 0, D_MODEL);
+    let k: Tensor<3> = qkv.clone().narrow(2, D_MODEL, D_MODEL);
+    let v: Tensor<3> = qkv.narrow(2, 2 * D_MODEL, D_MODEL);
+    let q: Tensor<4> = q.reshape([1, M_PATCHES, N_HEADS, HEAD_DIM]);
+    let k: Tensor<4> = k.reshape([1, M_PATCHES, N_HEADS, HEAD_DIM]);
+    let v: Tensor<4> = v.reshape([1, M_PATCHES, N_HEADS, HEAD_DIM]);
+    let q = rope.apply(q, rope_offset);
+    let k = rope.apply(k, rope_offset);
+    let q = rms_norm_nd(q, w.q_norm_w.clone());
+    let k = rms_norm_nd(k, w.k_norm_w.clone());
+    let scale = w
+        .q_scale
+        .clone()
+        .unsqueeze_dim::<2>(0)
+        .unsqueeze_dim::<3>(0)
+        .unsqueeze_dim::<4>(0);
+    let q = q * scale;
+    let q: Tensor<4> = q.permute([0, 2, 1, 3]);
+    let k: Tensor<4> = k.permute([0, 2, 1, 3]);
+    let v: Tensor<4> = v.permute([0, 2, 1, 3]);
+    let k_full = Tensor::cat(vec![cache.0.clone(), k], 2);
+    let v_full = Tensor::cat(vec![cache.1.clone(), v], 2);
+    let scores = q.matmul(k_full.clone().transpose()) + mask;
+    let attn_w = softmax_last(scores);
+    let ctx = attn_w.matmul(v_full.clone());
+    let ctx: Tensor<4> = ctx.permute([0, 2, 1, 3]);
+    let ctx: Tensor<3> = ctx.reshape([1, M_PATCHES, D_MODEL]);
+    (linear_nd(ctx, w.out_w.clone(), None), k_full, v_full)
 }
-
-/// Decode-step causal mask: shape [1,1,new_len,cache_len+new_len].
-/// New query i can attend to all cached tokens plus new tokens 0..=i.
-fn make_decode_mask(new_len: usize, cache_len: usize, device: &Device) -> Result<Tensor> {
-    let total = cache_len + new_len;
-    let data: Vec<f32> = (0..new_len)
-        .flat_map(|q_rel| {
-            (0..total).map(move |k_abs| {
-                if k_abs <= cache_len + q_rel {
-                    0.0f32
-                } else {
-                    f32::NEG_INFINITY
-                }
-            })
-        })
-        .collect();
-    Ok(Tensor::from_vec(data, (new_len, total), device)?
-        .unsqueeze(0)?
-        .unsqueeze(0)?)
-}
-
-// ---------------------------------------------------------------------------
-// Running statistics (mirrors Python update_running_stats)
-// ---------------------------------------------------------------------------
 
 fn update_running_stats(
     n: f32,
@@ -674,7 +614,6 @@ fn update_running_stats(
             / inc_n
     };
     let inc_sigma = inc_var.sqrt();
-
     let new_n = n + inc_n;
     let safe_new_n = if new_n == 0.0 { 1.0 } else { new_n };
     let new_mu = if new_n == 0.0 {
@@ -694,14 +633,6 @@ fn update_running_stats(
     (new_n, new_mu, new_var.max(0.0).sqrt())
 }
 
-// ---------------------------------------------------------------------------
-// Input preparation
-// ---------------------------------------------------------------------------
-
-/// Build tokenizer input tensor [n_patches, 2*INPUT_PATCH=64].
-///
-/// For each patch: cat([normed_values, mask_as_float], dim=-1).
-/// Masked (padded) positions → value=0.0, mask=1.0.
 fn build_tokenizer_input(
     vals: &[f32],
     mask: &[bool],
@@ -709,7 +640,7 @@ fn build_tokenizer_input(
     p: usize,
     mus: &[f32],
     sigmas: &[f32],
-) -> Tensor {
+) -> Tensor<2> {
     let mut data = vec![0.0f32; n_patches * 2 * p];
     for pi in 0..n_patches {
         let mu = mus[pi];
@@ -724,29 +655,20 @@ fn build_tokenizer_input(
                 (vals[idx] - mu) / sigma_safe
             };
             let base = pi * 2 * p;
-            data[base + i] = normed; // value channel
-            data[base + p + i] = if is_masked { 1.0 } else { 0.0 }; // mask channel
+            data[base + i] = normed;
+            data[base + p + i] = if is_masked { 1.0 } else { 0.0 };
         }
     }
-    Tensor::from_vec(data, (n_patches, 2 * p), &Device::Cpu).expect("build_tokenizer_input")
+    Tensor::<2>::from_data(TensorData::new(data, [n_patches, 2 * p]), &device())
 }
 
-// ---------------------------------------------------------------------------
-// Output denormalization
-// ---------------------------------------------------------------------------
-
-/// Denorm output [n_patches, D_MODEL] → flat vec of [n_patches][O][Q] triples.
-///
-/// Each patch i is denormed: out * sigma[i] + mu[i].
-/// Then reshaped to [OUTPUT_PATCH, N_OUTPUTS].
 fn denorm_flat(
-    output: &Tensor, // [n_patches, D_MODEL]
+    flat: &[f32],
     mus: &[f32],
     sigmas: &[f32],
     o: usize,
     q: usize,
-) -> Result<Vec<Vec<[f32; N_OUTPUTS]>>> {
-    let flat = output.flatten_all()?.to_vec1::<f32>()?;
+) -> Vec<Vec<[f32; N_OUTPUTS]>> {
     let n = mus.len();
     let mut result: Vec<Vec<[f32; N_OUTPUTS]>> = vec![vec![[0.0f32; N_OUTPUTS]; o]; n];
     for pi in 0..n {
@@ -759,34 +681,194 @@ fn denorm_flat(
             }
         }
     }
-    Ok(result)
+    result
 }
 
-// ---------------------------------------------------------------------------
-// zsfm-core::Forecaster
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl zsfm_core::Forecaster for TimesFMModel {
-    /// No config.json exists for this model — architecture is fixed at compile time.
-    type Config = ();
-
-    fn load(gguf_path: &Path, _config: ()) -> Result<Self> {
-        TimesFMModel::load(gguf_path)
+    pub(crate) fn pseudo(n: usize, seed: u64) -> Vec<f32> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+            })
+            .collect()
     }
 
-    /// TimesFM's `forecast()` is univariate-only and always treats the context as fully
-    /// observed; `mask` is unused.
-    fn forecast(
-        &self,
-        context: &[Vec<f32>],
-        _mask: &[Vec<bool>],
-        horizon: usize,
-    ) -> Result<zsfm_core::QuantileMatrix> {
-        anyhow::ensure!(
-            context.len() == 1,
-            "TimesFMModel only supports univariate forecasting (1 variate)"
+    pub(crate) fn max_err(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// Host reference for the GPT-NeoX-style RoPE in [`BurnRope`].
+    fn host_rope(x: &[f32], b: usize, seq: usize, h: usize, hd: usize, start: usize) -> Vec<f32> {
+        let half = hd / 2;
+        let inv_freq: Vec<f64> = (0..half)
+            .map(|i| 1.0 / ROPE_THETA.powf(2.0 * i as f64 / hd as f64))
+            .collect();
+        let mut out = vec![0.0f32; x.len()];
+        for bi in 0..b {
+            for s in 0..seq {
+                let pos = start + s;
+                for hi in 0..h {
+                    let base = (bi * seq * h + s * h + hi) * hd;
+                    for i in 0..half {
+                        let angle = (pos as f64 * inv_freq[i]) as f32;
+                        let (sn, cs) = angle.sin_cos();
+                        let x1 = x[base + i];
+                        let x2 = x[base + half + i];
+                        out[base + i] = x1 * cs - x2 * sn;
+                        out[base + half + i] = x2 * cs + x1 * sn;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn rope_matches_host() {
+        let burn_rope = BurnRope::build(HEAD_DIM, 16, ROPE_THETA);
+        let xv = pseudo(1 * 4 * 2 * HEAD_DIM, 7);
+        let bx =
+            Tensor::<4>::from_data(TensorData::new(xv.clone(), [1, 4, 2, HEAD_DIM]), &device());
+        let got: Vec<f32> = burn_rope.apply(bx, 2).to_data().try_to_vec().unwrap();
+        let expected = host_rope(&xv, 1, 4, 2, HEAD_DIM, 2);
+        let err = max_err(&expected, &got);
+        assert!(err < 1e-5, "rope mismatch: {err:.2e}");
+    }
+
+    fn host_linear(
+        x: &[f32],
+        n: usize,
+        w: &[f32],
+        r: usize,
+        c: usize,
+        b: Option<&[f32]>,
+    ) -> Vec<f32> {
+        assert_eq!(x.len(), n * c);
+        assert_eq!(w.len(), r * c);
+        let mut y = vec![0.0f32; n * r];
+        for i in 0..n {
+            for o in 0..r {
+                let mut acc = 0.0f32;
+                for k in 0..c {
+                    acc += w[o * c + k] * x[i * c + k];
+                }
+                if let Some(bv) = b {
+                    acc += bv[o];
+                }
+                y[i * r + o] = acc;
+            }
+        }
+        y
+    }
+
+    fn host_silu(x: &[f32]) -> Vec<f32> {
+        x.iter().map(|&v| v / (1.0 + (-v).exp())).collect()
+    }
+
+    #[test]
+    fn residual_block_matches_host() {
+        // Small dims: in=8, hidden=16, out=16, with bias.
+        let (din, h, dout, n) = (8usize, 16usize, 16usize, 4usize);
+        let w = |r: usize, c: usize, s: u64| pseudo(r * c, s);
+        let hw = w(h, din, 21);
+        let hb = pseudo(h, 22);
+        let ow = w(dout, h, 23);
+        let ob = pseudo(dout, 24);
+        let sw = w(dout, din, 25);
+        let sb = pseudo(dout, 26);
+        let xv = pseudo(n * din, 27);
+
+        let hh = host_silu(&host_linear(&xv, n, &hw, h, din, Some(&hb)));
+        let out = host_linear(&hh, n, &ow, dout, h, Some(&ob));
+        let skip = host_linear(&xv, n, &sw, dout, din, Some(&sb));
+        let expected: Vec<f32> = out.iter().zip(skip.iter()).map(|(a, b)| a + b).collect();
+
+        let bdev = device();
+        let bxb = Tensor::<2>::from_data(TensorData::new(xv, [n, din]), &bdev);
+        let bw = BurnResidualBlockW {
+            hidden_w: Tensor::<2>::from_data(TensorData::new(hw, [h, din]), &bdev),
+            hidden_b: Some(Tensor::<1>::from_data(TensorData::new(hb, [h]), &bdev)),
+            output_w: Tensor::<2>::from_data(TensorData::new(ow, [dout, h]), &bdev),
+            output_b: Some(Tensor::<1>::from_data(TensorData::new(ob, [dout]), &bdev)),
+            skip_w: Tensor::<2>::from_data(TensorData::new(sw, [dout, din]), &bdev),
+            skip_b: Some(Tensor::<1>::from_data(TensorData::new(sb, [dout]), &bdev)),
+        };
+        let got: Vec<f32> = forward_residual_block(bxb, &bw)
+            .to_data()
+            .try_to_vec()
+            .unwrap();
+        let err = max_err(&expected, &got);
+        assert!(err < 1e-4, "residual mismatch: {err:.2e}");
+    }
+
+    #[test]
+    fn prefill_attention_burn_golden() {
+        // Real widths (D_MODEL=1280, 16 heads x 80), 2 patches, random weights.
+        // Exercises split/rope/norm/scale/permute/scores/softmax; golden pins output.
+        let n = 2usize;
+        let mk = |r: usize, c: usize, s: u64| {
+            pseudo(r * c, s)
+                .into_iter()
+                .map(|v| v * 0.02)
+                .collect::<Vec<_>>()
+        };
+
+        let qkv_v = mk(3 * D_MODEL, D_MODEL, 31);
+        let out_v = mk(D_MODEL, D_MODEL, 32);
+        let qn_v = pseudo(HEAD_DIM, 33);
+        let kn_v = pseudo(HEAD_DIM, 34);
+        let qs_v = compute_q_scale(pseudo(HEAD_DIM, 35));
+        let xv = pseudo(n * D_MODEL, 36);
+
+        let bdev = device();
+        let bx = Tensor::<3>::from_data(TensorData::new(xv, [1, n, D_MODEL]), &bdev);
+        let bw = BurnAttnW {
+            qkv_w: Tensor::<2>::from_data(TensorData::new(qkv_v, [3 * D_MODEL, D_MODEL]), &bdev),
+            out_w: Tensor::<2>::from_data(
+                TensorData::new(out_v.clone(), [D_MODEL, D_MODEL]),
+                &bdev,
+            ),
+            q_norm_w: Tensor::<1>::from_data(TensorData::new(qn_v, [HEAD_DIM]), &bdev),
+            k_norm_w: Tensor::<1>::from_data(TensorData::new(kn_v, [HEAD_DIM]), &bdev),
+            q_scale: Tensor::<1>::from_data(TensorData::new(qs_v, [HEAD_DIM]), &bdev),
+            pre_norm_w: Tensor::<1>::from_data(
+                TensorData::new(vec![1.0f32; D_MODEL], [D_MODEL]),
+                &bdev,
+            ),
+            post_norm_w: Tensor::<1>::from_data(
+                TensorData::new(vec![1.0f32; D_MODEL], [D_MODEL]),
+                &bdev,
+            ),
+        };
+        let brope = BurnRope::build(HEAD_DIM, 32, ROPE_THETA);
+        let t0 = std::time::Instant::now();
+        let (got_t, _, _) = burn_prefill_attn(bx, &bw, &brope, n, burn_causal_mask(n));
+        let burn_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let got: Vec<f32> = got_t.to_data().try_to_vec().unwrap();
+        assert_eq!(got.len(), n * D_MODEL);
+        assert!(got.iter().all(|v| v.is_finite()));
+        let sum: f32 = got.iter().sum();
+        let head = [got[0], got[1], got[511], got[1024], got[2559]];
+        println!("timesfm attn [n={n}]: burn {burn_ms:.1}ms sum={sum:.6} head={head:?}");
+        // Golden recorded from the verified Burn implementation.
+        let golden_sum = -210195.125f32;
+        let golden_head = [-82.57538, -79.27846, -84.41953, -81.87318, -82.0369];
+        assert!(
+            (sum - golden_sum).abs() < 2.0,
+            "attn sum drift: {sum} vs {golden_sum}"
         );
-        let outputs = TimesFMModel::forecast(self, &context[0], horizon)?; // [N_OUTPUTS][horizon]
-        Ok(outputs.into_iter().map(|row| vec![row]).collect())
+        for (g, e) in head.iter().zip(golden_head.iter()) {
+            assert!((g - e).abs() < 1e-4, "attn head drift: {g} vs {e}");
+        }
     }
 }

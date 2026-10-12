@@ -4,4 +4,4 @@ pub mod infer;
 pub mod tensor_map;
 
 pub use config::TtmConfig;
-pub use infer::{TtmModel, TtmModelBuilder};
+pub use infer::BurnTtmModel;

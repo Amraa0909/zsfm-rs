@@ -4,12 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Burn-backend inference spike: shared Burn tensor ops, candle-vs-Burn parity checks, and op microbenchmarks."
+description = "Burn-backend inference: shared Burn tensor ops, direct GGUF weight loading, and op microbenchmarks."
 
 [dependencies]
 anyhow.workspace = true
 burn.workspace = true
-candle-core.workspace = true
 zsfm-gguf.workspace = true
 zsfm-checkpoint.workspace = true
 

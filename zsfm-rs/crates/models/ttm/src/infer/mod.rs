@@ -1,199 +1,132 @@
-//! TinyTimeMixer inference engine.
+//! TinyTimeMixer Burn-only inference engine (Burn backend, Flex CPU).
 //!
-//! Architecture: MLP-Mixer with adaptive patching.
-//! - StdScaler → Patchify → Linear patcher → 3 adaptive levels → Linear adapter →
-//!   2 decoder layers → Flatten → Linear head → inverse scale
-//! - No attention. Each "mixer layer" = PatchMixerBlock + FeatureMixerBlock.
-//! - GatedAttention: softmax(linear(x)) * x applied after each MLP.
-//!
-//! Burn port lives in [`burn`](crate::infer::burn) (`BurnTtmModel`).
+//! StdScaler → patchify → mixer stack → inverse scale, with weights loaded
+//! straight from GGUF via [`zsfm_burn::GgufWeights`].
 
-use std::io::{BufReader, Read, Seek};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use anyhow::{Context, Result};
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device, Tensor};
-use zsfm_nn::{layer_norm, linear};
+use anyhow::Result;
+use burn::tensor::{activation, Device, Tensor, TensorData};
+use zsfm_burn::{open_gguf_weights, GgufWeights};
 
 use crate::config::TtmConfig;
 
-pub mod burn;
-
-// ---------------------------------------------------------------------------
-// Weight structs
-// ---------------------------------------------------------------------------
-
-struct MixerLayer {
-    patch_norm_w: Tensor,
-    patch_norm_b: Tensor,
-    patch_fc1_w: Tensor,
-    patch_fc1_b: Tensor,
-    patch_fc2_w: Tensor,
-    patch_fc2_b: Tensor,
-    patch_gate_w: Tensor,
-    patch_gate_b: Tensor,
-    feat_norm_w: Tensor,
-    feat_norm_b: Tensor,
-    feat_fc1_w: Tensor,
-    feat_fc1_b: Tensor,
-    feat_fc2_w: Tensor,
-    feat_fc2_b: Tensor,
-    feat_gate_w: Tensor,
-    feat_gate_b: Tensor,
+fn device() -> Device {
+    Device::flex()
 }
 
-struct AdaptiveLevel {
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
+}
+
+fn load_v(weights: &GgufWeights, name: &str) -> Result<Tensor<1>> {
+    weights.load_1d(name)
+}
+
+struct BurnMixerLayer {
+    patch_norm_w: Tensor<1>,
+    patch_norm_b: Tensor<1>,
+    patch_fc1_w: Tensor<2>,
+    patch_fc1_b: Tensor<1>,
+    patch_fc2_w: Tensor<2>,
+    patch_fc2_b: Tensor<1>,
+    patch_gate_w: Tensor<2>,
+    patch_gate_b: Tensor<1>,
+    feat_norm_w: Tensor<1>,
+    feat_norm_b: Tensor<1>,
+    feat_fc1_w: Tensor<2>,
+    feat_fc1_b: Tensor<1>,
+    feat_fc2_w: Tensor<2>,
+    feat_fc2_b: Tensor<1>,
+    feat_gate_w: Tensor<2>,
+    feat_gate_b: Tensor<1>,
+}
+
+struct BurnAdaptiveLevel {
     factor: usize,
-    layers: Vec<MixerLayer>,
+    layers: Vec<BurnMixerLayer>,
 }
 
-pub struct TtmModel {
-    device: Device,
+pub struct BurnTtmModel {
     config: TtmConfig,
-    patcher_w: Tensor,
-    patcher_b: Tensor,
-    enc_levels: Vec<AdaptiveLevel>,
-    dec_adapter_w: Tensor,
-    dec_adapter_b: Tensor,
-    dec_layers: Vec<MixerLayer>,
-    head_w: Tensor,
-    head_b: Tensor,
+    patcher_w: Tensor<2>,
+    patcher_b: Tensor<1>,
+    enc_levels: Vec<BurnAdaptiveLevel>,
+    dec_adapter_w: Tensor<2>,
+    dec_adapter_b: Tensor<1>,
+    dec_layers: Vec<BurnMixerLayer>,
+    head_w: Tensor<2>,
+    head_b: Tensor<1>,
 }
 
-// ---------------------------------------------------------------------------
-// Builder
-// ---------------------------------------------------------------------------
-
-/// Fluent constructor for [`TtmModel`]. `TtmConfig` (from a parsed `config.json`) doubles as
-/// this model's load-time config — there's no separate `InferConfig` to map onto.
-///
-/// ```no_run
-/// use zsfm_ttm::TtmModel;
-///
-/// # fn main() -> anyhow::Result<()> {
-/// let model = TtmModel::builder("ttm.gguf")
-///     .config_json(&std::fs::read_to_string("config.json")?)?
-///     .build()?;
-/// # Ok(()) }
-/// ```
-pub struct TtmModelBuilder {
-    gguf_path: PathBuf,
-    config: Option<TtmConfig>,
-}
-
-impl TtmModelBuilder {
-    fn new(gguf_path: impl Into<PathBuf>) -> Self {
-        Self {
-            gguf_path: gguf_path.into(),
-            config: None,
-        }
-    }
-
-    pub fn config(mut self, config: TtmConfig) -> Self {
-        self.config = Some(config);
-        self
-    }
-
-    pub fn config_json(mut self, s: &str) -> Result<Self> {
-        self.config = Some(TtmConfig::from_json(s)?);
-        Ok(self)
-    }
-
-    pub fn build(self) -> Result<TtmModel> {
-        let config = self
-            .config
-            .context("TtmModelBuilder: no config set — call .config(...) or .config_json(...)")?;
-        TtmModel::load(&self.gguf_path, config)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// GGUF loading
-// ---------------------------------------------------------------------------
-
-fn load_t(
-    content: &gguf_file::Content,
-    reader: &mut (impl Read + Seek),
-    name: &str,
-    device: &Device,
-) -> Result<Tensor> {
-    zsfm_nn::load_tensor(content, reader, name, device, DType::F32)
-}
-
-fn load_mixer_layer(
-    content: &gguf_file::Content,
-    reader: &mut (impl Read + Seek),
-    prefix: &str,
-    device: &Device,
-) -> Result<MixerLayer> {
-    let mut t =
-        |s: &str| -> Result<Tensor> { load_t(content, reader, &format!("{prefix}.{s}"), device) };
-    Ok(MixerLayer {
-        patch_norm_w: t("patch_norm.weight")?,
-        patch_norm_b: t("patch_norm.bias")?,
-        patch_fc1_w: t("patch_fc1.weight")?,
-        patch_fc1_b: t("patch_fc1.bias")?,
-        patch_fc2_w: t("patch_fc2.weight")?,
-        patch_fc2_b: t("patch_fc2.bias")?,
-        patch_gate_w: t("patch_gate.weight")?,
-        patch_gate_b: t("patch_gate.bias")?,
-        feat_norm_w: t("feat_norm.weight")?,
-        feat_norm_b: t("feat_norm.bias")?,
-        feat_fc1_w: t("feat_fc1.weight")?,
-        feat_fc1_b: t("feat_fc1.bias")?,
-        feat_fc2_w: t("feat_fc2.weight")?,
-        feat_fc2_b: t("feat_fc2.bias")?,
-        feat_gate_w: t("feat_gate.weight")?,
-        feat_gate_b: t("feat_gate.bias")?,
+fn load_mixer_layer(weights: &GgufWeights, prefix: &str) -> Result<BurnMixerLayer> {
+    Ok(BurnMixerLayer {
+        patch_norm_w: load_v(weights, &format!("{prefix}.patch_norm.weight"))?,
+        patch_norm_b: load_v(weights, &format!("{prefix}.patch_norm.bias"))?,
+        patch_fc1_w: load_t(weights, &format!("{prefix}.patch_fc1.weight"))?,
+        patch_fc1_b: load_v(weights, &format!("{prefix}.patch_fc1.bias"))?,
+        patch_fc2_w: load_t(weights, &format!("{prefix}.patch_fc2.weight"))?,
+        patch_fc2_b: load_v(weights, &format!("{prefix}.patch_fc2.bias"))?,
+        patch_gate_w: load_t(weights, &format!("{prefix}.patch_gate.weight"))?,
+        patch_gate_b: load_v(weights, &format!("{prefix}.patch_gate.bias"))?,
+        feat_norm_w: load_v(weights, &format!("{prefix}.feat_norm.weight"))?,
+        feat_norm_b: load_v(weights, &format!("{prefix}.feat_norm.bias"))?,
+        feat_fc1_w: load_t(weights, &format!("{prefix}.feat_fc1.weight"))?,
+        feat_fc1_b: load_v(weights, &format!("{prefix}.feat_fc1.bias"))?,
+        feat_fc2_w: load_t(weights, &format!("{prefix}.feat_fc2.weight"))?,
+        feat_fc2_b: load_v(weights, &format!("{prefix}.feat_fc2.bias"))?,
+        feat_gate_w: load_t(weights, &format!("{prefix}.feat_gate.weight"))?,
+        feat_gate_b: load_v(weights, &format!("{prefix}.feat_gate.bias"))?,
     })
 }
 
-impl TtmModel {
-    /// Start building a [`TtmModel`] — see [`TtmModelBuilder`].
-    pub fn builder(gguf_path: impl Into<PathBuf>) -> TtmModelBuilder {
-        TtmModelBuilder::new(gguf_path)
-    }
+fn linear(x: Tensor<2>, w: Tensor<2>, b: Tensor<1>) -> Tensor<2> {
+    zsfm_burn::linear::burn_linear_bias(x, w, b)
+}
 
+fn layer_norm(x: Tensor<2>, w: Tensor<1>, b: Tensor<1>, eps: f32) -> Tensor<2> {
+    zsfm_burn::norm::burn_layer_norm(x, w, b, eps)
+}
+
+fn gelu(x: Tensor<2>) -> Tensor<2> {
+    activation::gelu(x)
+}
+
+fn softmax_last_dim(x: Tensor<2>) -> Tensor<2> {
+    activation::softmax(x, 1)
+}
+
+impl BurnTtmModel {
     pub fn load(gguf_path: &Path, config: TtmConfig) -> Result<Self> {
-        let device = Device::Cpu;
-        let file = std::fs::File::open(gguf_path)
-            .with_context(|| format!("open {}", gguf_path.display()))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-        let content = gguf_file::Content::read(&mut reader).context("parse GGUF header")?;
+        let weights = open_gguf_weights(gguf_path)?;
 
-        let patcher_w = load_t(&content, &mut reader, "enc.patcher.weight", &device)?;
-        let patcher_b = load_t(&content, &mut reader, "enc.patcher.bias", &device)?;
+        let patcher_w = load_t(&weights, "enc.patcher.weight")?;
+        let patcher_b = load_v(&weights, "enc.patcher.bias")?;
 
         let n_levels = config.adaptive_patching_levels;
-        let n_enc_layers = config.num_layers;
         let mut enc_levels = Vec::with_capacity(n_levels);
         for l in 0..n_levels {
-            // mixers[0] was created with adapt_patch_level = n_levels-1, factor = 2^(n_levels-1)
             let factor = 1usize << (n_levels - 1 - l);
-            let mut layers = Vec::with_capacity(n_enc_layers);
-            for n in 0..n_enc_layers {
-                let prefix = format!("enc.blk.{l}.layer.{n}");
-                layers.push(load_mixer_layer(&content, &mut reader, &prefix, &device)?);
+            let mut layers = Vec::with_capacity(config.num_layers);
+            for n in 0..config.num_layers {
+                layers.push(load_mixer_layer(
+                    &weights,
+                    &format!("enc.blk.{l}.layer.{n}"),
+                )?);
             }
-            enc_levels.push(AdaptiveLevel { factor, layers });
+            enc_levels.push(BurnAdaptiveLevel { factor, layers });
         }
 
-        let dec_adapter_w = load_t(&content, &mut reader, "dec.adapter.weight", &device)?;
-        let dec_adapter_b = load_t(&content, &mut reader, "dec.adapter.bias", &device)?;
-
-        let n_dec_layers = config.decoder_num_layers;
-        let mut dec_layers = Vec::with_capacity(n_dec_layers);
-        for n in 0..n_dec_layers {
-            let prefix = format!("dec.blk.{n}");
-            dec_layers.push(load_mixer_layer(&content, &mut reader, &prefix, &device)?);
+        let dec_adapter_w = load_t(&weights, "dec.adapter.weight")?;
+        let dec_adapter_b = load_v(&weights, "dec.adapter.bias")?;
+        let mut dec_layers = Vec::with_capacity(config.decoder_num_layers);
+        for n in 0..config.decoder_num_layers {
+            dec_layers.push(load_mixer_layer(&weights, &format!("dec.blk.{n}"))?);
         }
-
-        let head_w = load_t(&content, &mut reader, "head.weight", &device)?;
-        let head_b = load_t(&content, &mut reader, "head.bias", &device)?;
+        let head_w = load_t(&weights, "head.weight")?;
+        let head_b = load_v(&weights, "head.bias")?;
 
         Ok(Self {
-            device,
             config,
             patcher_w,
             patcher_b,
@@ -206,140 +139,98 @@ impl TtmModel {
         })
     }
 
-    // -----------------------------------------------------------------------
-    // Inference
-    // -----------------------------------------------------------------------
-
-    /// Forecast univariate time series.
-    ///
-    /// `context` must be at least `config.patch_length` long.
-    /// Returns `config.prediction_length` forecast values.
     pub fn forecast(&self, context: &[f32]) -> Result<Vec<f32>> {
         let cfg = &self.config;
-
-        // 1. StdScaler
         let (scaled, mean, std) = std_scale(context);
-
-        // 2. Patchify → [num_patches, patch_length]
         let patches = patchify(&scaled, cfg.patch_length, cfg.patch_stride, cfg.num_patches);
         let flat: Vec<f32> = patches.into_iter().flatten().collect();
-        let mut h = Tensor::from_vec(flat, (cfg.num_patches, cfg.patch_length), &self.device)?;
+        let dev = device();
+        let mut h = Tensor::<2>::from_data(
+            TensorData::new(flat, [cfg.num_patches, cfg.patch_length]),
+            &dev,
+        );
 
-        // 3. Patcher Linear(patch_length → d_model) → [num_patches, d_model]
-        h = linear(&h, &self.patcher_w, Some(&self.patcher_b))?;
-
-        // 4. Encoder adaptive patching (3 levels)
+        h = linear(h, self.patcher_w.clone(), self.patcher_b.clone());
         for level in &self.enc_levels {
-            h = self.forward_adaptive_level(&h, level)?;
+            h = self.forward_adaptive_level(h, level);
         }
-
-        // 5. Decoder adapter Linear(d_model → decoder_d_model) → [num_patches, decoder_d_model]
-        h = linear(&h, &self.dec_adapter_w, Some(&self.dec_adapter_b))?;
-
-        // 6. Decoder block (regular mixer layers)
+        h = linear(h, self.dec_adapter_w.clone(), self.dec_adapter_b.clone());
         for layer in &self.dec_layers {
-            h = forward_mixer_layer(&h, layer, cfg.norm_eps)?;
+            h = forward_mixer_layer(h, layer, cfg.norm_eps as f32);
         }
-
-        // 7. Flatten → [num_patches * decoder_d_model]
         let flat_dim = cfg.num_patches * cfg.decoder_d_model;
-        h = h.reshape((flat_dim,))?;
-
-        // 8. Head Linear(flat_dim → prediction_length) → [prediction_length]
-        h = h.unsqueeze(0)?; // [1, flat_dim]
-        h = linear(&h, &self.head_w, Some(&self.head_b))?; // [1, prediction_length]
-        h = h.squeeze(0)?; // [prediction_length]
-
-        // 9. Inverse scale
-        let forecast: Vec<f32> = h.to_vec1()?;
+        let h = h.reshape([flat_dim]);
+        let h = h.unsqueeze_dim::<2>(0);
+        let h = linear(h, self.head_w.clone(), self.head_b.clone());
+        let h: Tensor<1> = h.squeeze_dim(0);
+        let forecast: Vec<f32> = h.to_data().try_to_vec()?;
         Ok(forecast.iter().map(|&v| v * std + mean).collect())
     }
 
-    fn forward_adaptive_level(&self, hidden: &Tensor, level: &AdaptiveLevel) -> Result<Tensor> {
+    fn forward_adaptive_level(&self, hidden: Tensor<2>, level: &BurnAdaptiveLevel) -> Tensor<2> {
         let factor = level.factor;
-        let (p, f) = (hidden.dim(0)?, hidden.dim(1)?);
-
-        // Reshape: [P, F] → [P*factor, F/factor]
+        let [p, f] = hidden.dims();
         let mut h = if factor > 1 {
-            hidden.reshape((p * factor, f / factor))?
+            hidden.reshape([p * factor, f / factor])
         } else {
-            hidden.clone()
+            hidden
         };
-
         for layer in &level.layers {
-            h = forward_mixer_layer(&h, layer, self.config.norm_eps)?;
+            h = forward_mixer_layer(h, layer, self.config.norm_eps as f32);
         }
-
-        // Reshape back: [P*factor, F/factor] → [P, F]
         if factor > 1 {
-            Ok(h.reshape((p, f))?)
+            h.reshape([p, f])
         } else {
-            Ok(h)
+            h
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// MLP-Mixer forward
-// ---------------------------------------------------------------------------
-
-fn forward_mixer_layer(hidden: &Tensor, layer: &MixerLayer, norm_eps: f64) -> Result<Tensor> {
-    let h = forward_patch_mixer(hidden, layer, norm_eps)?;
-    forward_feat_mixer(&h, layer, norm_eps)
+fn forward_mixer_layer(h: Tensor<2>, layer: &BurnMixerLayer, eps: f32) -> Tensor<2> {
+    forward_feat_mixer(forward_patch_mixer(h.clone(), layer, eps), layer, eps)
 }
 
-/// PatchMixerBlock: normalize features, transpose, MLP on patch dim, gate, transpose back.
-fn forward_patch_mixer(hidden: &Tensor, w: &MixerLayer, eps: f64) -> Result<Tensor> {
-    // LayerNorm on feature dim (last dim)
-    let h = layer_norm(hidden, &w.patch_norm_w, &w.patch_norm_b, eps)?;
-    // Transpose [P, F] → [F, P]
-    let h = h.t()?.contiguous()?;
-    // MLP on last dim (P)
-    let h = linear(&h, &w.patch_fc1_w, Some(&w.patch_fc1_b))?.gelu_erf()?;
-    let h = linear(&h, &w.patch_fc2_w, Some(&w.patch_fc2_b))?;
-    // Gated attention: softmax(linear(h)) * h
-    let gate =
-        candle_nn::ops::softmax_last_dim(&linear(&h, &w.patch_gate_w, Some(&w.patch_gate_b))?)?;
-    let h = (h * gate)?;
-    // Transpose back [F, P] → [P, F]
-    let h = h.t()?.contiguous()?;
-    // Residual
-    Ok((h + hidden)?)
+fn forward_patch_mixer(h: Tensor<2>, w: &BurnMixerLayer, eps: f32) -> Tensor<2> {
+    let normed = layer_norm(
+        h.clone(),
+        w.patch_norm_w.clone(),
+        w.patch_norm_b.clone(),
+        eps,
+    );
+    let t = normed.transpose();
+    let m = gelu(linear(t, w.patch_fc1_w.clone(), w.patch_fc1_b.clone()));
+    let m = linear(m, w.patch_fc2_w.clone(), w.patch_fc2_b.clone());
+    let gate = softmax_last_dim(linear(
+        m.clone(),
+        w.patch_gate_w.clone(),
+        w.patch_gate_b.clone(),
+    ));
+    let gated = m * gate;
+    gated.transpose() + h
 }
 
-/// FeatureMixerBlock: normalize features, MLP on feature dim, gate, add residual.
-fn forward_feat_mixer(hidden: &Tensor, w: &MixerLayer, eps: f64) -> Result<Tensor> {
-    let h = layer_norm(hidden, &w.feat_norm_w, &w.feat_norm_b, eps)?;
-    let h = linear(&h, &w.feat_fc1_w, Some(&w.feat_fc1_b))?.gelu_erf()?;
-    let h = linear(&h, &w.feat_fc2_w, Some(&w.feat_fc2_b))?;
-    let gate =
-        candle_nn::ops::softmax_last_dim(&linear(&h, &w.feat_gate_w, Some(&w.feat_gate_b))?)?;
-    let h = (h * gate)?;
-    Ok((h + hidden)?)
+fn forward_feat_mixer(h: Tensor<2>, w: &BurnMixerLayer, eps: f32) -> Tensor<2> {
+    let normed = layer_norm(h.clone(), w.feat_norm_w.clone(), w.feat_norm_b.clone(), eps);
+    let m = gelu(linear(normed, w.feat_fc1_w.clone(), w.feat_fc1_b.clone()));
+    let m = linear(m, w.feat_fc2_w.clone(), w.feat_fc2_b.clone());
+    let gate = softmax_last_dim(linear(
+        m.clone(),
+        w.feat_gate_w.clone(),
+        w.feat_gate_b.clone(),
+    ));
+    let gated = m * gate;
+    gated + h
 }
 
-// ---------------------------------------------------------------------------
-// Primitive ops
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Preprocessing
-// ---------------------------------------------------------------------------
-
-/// Compute mean and std over context, return (normalized, mean, std).
 fn std_scale(x: &[f32]) -> (Vec<f32>, f32, f32) {
     let n = x.len() as f64;
     let mean = x.iter().map(|&v| v as f64).sum::<f64>() / n;
     let var = x.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
-    // minimum_scale = 1e-5 (matches Python TinyTimeMixerStdScaler)
     let std = (var + 1e-5).sqrt() as f32;
     let scaled: Vec<f32> = x.iter().map(|&v| (v as f32 - mean as f32) / std).collect();
     (scaled, mean as f32, std)
 }
 
-/// Extract `num_patches` patches of length `patch_length` with stride `patch_stride`.
-/// Uses the last `patch_length + patch_stride * (num_patches - 1)` timesteps.
-/// Left-pads with the first value when the context is shorter than needed.
 fn patchify(
     x: &[f32],
     patch_length: usize,
@@ -360,30 +251,119 @@ fn patchify(
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// zsfm-core::Forecaster
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zsfm_gguf::{GGMLType, GGUFMetaValue, GGUFWriter};
 
-impl zsfm_core::Forecaster for TtmModel {
-    type Config = TtmConfig;
-
-    fn load(gguf_path: &Path, config: TtmConfig) -> Result<Self> {
-        TtmModel::load(gguf_path, config)
+    fn pseudo(n: usize, seed: u64) -> Vec<f32> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+            })
+            .collect()
     }
 
-    /// TTM is univariate-only and point-forecast-only; `mask` is unused.
-    fn forecast(
-        &self,
-        context: &[Vec<f32>],
-        _mask: &[Vec<bool>],
-        horizon: usize,
-    ) -> Result<zsfm_core::QuantileMatrix> {
-        anyhow::ensure!(
-            context.len() == 1,
-            "TtmModel only supports univariate forecasting (1 variate)"
-        );
-        let raw = TtmModel::forecast(self, &context[0])?;
-        let point: Vec<f32> = raw.into_iter().take(horizon).collect();
-        Ok(vec![vec![point]])
+    fn test_config() -> TtmConfig {
+        TtmConfig {
+            context_length: 64,
+            prediction_length: 4,
+            patch_length: 4,
+            patch_stride: 2,
+            d_model: 8,
+            num_layers: 1,
+            decoder_d_model: 8,
+            decoder_num_layers: 1,
+            expansion_factor: 2,
+            adaptive_patching_levels: 1,
+            num_patches: 4,
+            scaling: "std".into(),
+            gated_attn: true,
+            norm_eps: 1e-5,
+        }
+    }
+
+    /// Write logical [R,C] row-major data with GGUF (reversed) shape [C,R].
+    fn put2(w: &mut GGUFWriter, name: &str, rows: usize, cols: usize, seed: &mut u64) {
+        *seed += 1;
+        let data = pseudo(rows * cols, *seed);
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        w.add_tensor(name, vec![cols as u64, rows as u64], GGMLType::F32, bytes);
+    }
+
+    fn put1(w: &mut GGUFWriter, name: &str, n: usize, seed: &mut u64) {
+        *seed += 1;
+        let data = pseudo(n, *seed);
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        w.add_tensor(name, vec![n as u64], GGMLType::F32, bytes);
+    }
+
+    fn put_layer(w: &mut GGUFWriter, prefix: &str, p: usize, f: usize, seed: &mut u64) {
+        put1(w, &format!("{prefix}.patch_norm.weight"), f, seed);
+        put1(w, &format!("{prefix}.patch_norm.bias"), f, seed);
+        put2(w, &format!("{prefix}.patch_fc1.weight"), 2 * p, p, seed);
+        put1(w, &format!("{prefix}.patch_fc1.bias"), 2 * p, seed);
+        put2(w, &format!("{prefix}.patch_fc2.weight"), p, 2 * p, seed);
+        put1(w, &format!("{prefix}.patch_fc2.bias"), p, seed);
+        put2(w, &format!("{prefix}.patch_gate.weight"), p, p, seed);
+        put1(w, &format!("{prefix}.patch_gate.bias"), p, seed);
+        put1(w, &format!("{prefix}.feat_norm.weight"), f, seed);
+        put1(w, &format!("{prefix}.feat_norm.bias"), f, seed);
+        put2(w, &format!("{prefix}.feat_fc1.weight"), 2 * f, f, seed);
+        put1(w, &format!("{prefix}.feat_fc1.bias"), 2 * f, seed);
+        put2(w, &format!("{prefix}.feat_fc2.weight"), f, 2 * f, seed);
+        put1(w, &format!("{prefix}.feat_fc2.bias"), f, seed);
+        put2(w, &format!("{prefix}.feat_gate.weight"), f, f, seed);
+        put1(w, &format!("{prefix}.feat_gate.bias"), f, seed);
+    }
+
+    #[test]
+    fn burn_forecast_golden() {
+        let dir = std::env::temp_dir().join(format!("ttm-burn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf");
+
+        let mut w = GGUFWriter::new();
+        w.add_metadata("general.architecture", GGUFMetaValue::String("ttm".into()));
+        let mut seed = 100u64;
+        // P=4 patches, F=8 features.
+        put2(&mut w, "enc.patcher.weight", 8, 4, &mut seed);
+        put1(&mut w, "enc.patcher.bias", 8, &mut seed);
+        put_layer(&mut w, "enc.blk.0.layer.0", 4, 8, &mut seed);
+        put2(&mut w, "dec.adapter.weight", 8, 8, &mut seed);
+        put1(&mut w, "dec.adapter.bias", 8, &mut seed);
+        put_layer(&mut w, "dec.blk.0", 4, 8, &mut seed);
+        put2(&mut w, "head.weight", 4, 32, &mut seed);
+        put1(&mut w, "head.bias", 4, &mut seed);
+
+        let f = std::fs::File::create(&path).unwrap();
+        w.write_to(&mut std::io::BufWriter::new(f)).unwrap();
+
+        let cfg = test_config();
+        let burn = BurnTtmModel::load(&path, cfg).unwrap();
+
+        let ctx: Vec<f32> = (0..16).map(|i| 10.0 + 0.5 * i as f32).collect();
+        let t0 = std::time::Instant::now();
+        let a = burn.forecast(&ctx).unwrap();
+        let ms_a = t0.elapsed().as_secs_f64() * 1000.0;
+        let b = burn.forecast(&ctx).unwrap();
+        assert_eq!(a.len(), 4);
+        assert!(a.iter().all(|v| v.is_finite()));
+        assert!(a.iter().any(|&v| v != 0.0));
+        assert_eq!(a, b, "forecast must be deterministic");
+        println!("ttm synthetic: burn {ms_a:.3}ms out={a:?}");
+        // Golden values recorded from the verified Burn implementation.
+        let golden: [f32; 4] = [-414.10815, -425.1715, -473.70477, -365.27527];
+        assert_eq!(a.len(), golden.len());
+        for (x, y) in a.iter().zip(golden.iter()) {
+            assert!((x - y).abs() < 1e-5, "golden drift: {x} vs {y}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

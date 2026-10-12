@@ -761,8 +761,7 @@ fn delete(model: &str, model_dir: &str, output: Option<String>) -> PyResult<()> 
 // Forecasters — one #[pyclass] per model (point or quantile)
 // ---------------------------------------------------------------------------
 
-use zsfm_toto::config::TotoConfig;
-use zsfm_toto::infer::TotoModel as RustTotoModel;
+use zsfm_toto::infer::{BurnTotoModel as RustTotoModel, InferConfig};
 
 #[pyclass]
 struct TotoModel {
@@ -787,11 +786,13 @@ impl TotoModel {
         let v: serde_json::Value = serde_json::from_str(&s)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         let max_ctx = context_length.unwrap_or(4096);
-        let inner = RustTotoModel::builder(&gguf_path)
-            .config_json(&v)
-            .with_compute_f64(use_f64)
-            .build()
-            .map_err(|e| {
+        if use_f64 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "toto Burn engine supports compute_f64=false only",
+            ));
+        }
+        let inner =
+            RustTotoModel::load(&gguf_path, InferConfig::from_json_value(&v)).map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("load Toto {gguf}: {e}"))
             })?;
         // Store max_ctx via a wrapper? For now keep simple: the Rust model already encodes patch_size; we trim in forecast.
@@ -844,7 +845,7 @@ impl TotoModel {
     }
 }
 
-use zsfm_timesfm::infer::TimesFMModel as RustTimesFmModel;
+use zsfm_timesfm::infer::BurnTimesFMModel as RustTimesFmModel;
 #[pyclass]
 struct TimesFmModel {
     inner: RustTimesFmModel,
@@ -887,7 +888,7 @@ impl TimesFmModel {
     }
 }
 
-use zsfm_sundial::infer::SundialModel as RustSundialModel;
+use zsfm_sundial::infer::BurnSundialModel as RustSundialModel;
 #[pyclass]
 struct SundialModel {
     inner: RustSundialModel,
@@ -897,7 +898,7 @@ impl SundialModel {
     #[new]
     fn new(gguf: String) -> PyResult<Self> {
         let p = PathBuf::from(&gguf);
-        let inner = RustSundialModel::builder(&p).build().map_err(|e| {
+        let inner = RustSundialModel::load(&p, None).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("load Sundial {gguf}: {e}"))
         })?;
         Ok(Self { inner })
@@ -905,14 +906,14 @@ impl SundialModel {
     fn forecast(&self, context: Vec<f32>, horizon: usize) -> PyResult<Vec<f32>> {
         let raw = self
             .inner
-            .forecast(&context, &candle_core::Device::Cpu)
+            .forecast(&context)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(raw.into_iter().take(horizon).collect())
     }
 }
 
 use zsfm_ttm::config::TtmConfig;
-use zsfm_ttm::infer::TtmModel as RustTtmModel;
+use zsfm_ttm::infer::BurnTtmModel as RustTtmModel;
 
 #[pyclass]
 struct TtmModel {
@@ -946,12 +947,9 @@ impl TtmModel {
                 )));
             }
         };
-        let inner = RustTtmModel::builder(&gguf_path)
-            .config(ttm_config)
-            .build()
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("load TTM {gguf}: {e}"))
-            })?;
+        let inner = RustTtmModel::load(&gguf_path, ttm_config).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("load TTM {gguf}: {e}"))
+        })?;
         Ok(Self {
             inner,
             _config_path: config,
@@ -967,7 +965,7 @@ impl TtmModel {
 }
 
 use zsfm_lag_llama::config::LagLlamaConfig;
-use zsfm_lag_llama::infer::LagLlamaModel as RustLagLlamaModel;
+use zsfm_lag_llama::infer::BurnLagLlamaModel as RustLagLlamaModel;
 #[pyclass]
 struct LagLlamaModel {
     inner: RustLagLlamaModel,
@@ -993,7 +991,7 @@ impl LagLlamaModel {
 }
 
 use zsfm_moment::config::MomentConfig;
-use zsfm_moment::infer::MomentModel as RustMomentModel;
+use zsfm_moment::infer::BurnMomentModel as RustMomentModel;
 #[pyclass]
 struct MomentModel {
     inner: RustMomentModel,
@@ -1019,7 +1017,7 @@ impl MomentModel {
 }
 
 use zsfm_moirai::config::MoiraiConfig;
-use zsfm_moirai::infer::MoiraiModel as RustMoiraiModel;
+use zsfm_moirai::infer::BurnMoiraiModel as RustMoiraiModel;
 #[pyclass]
 struct MoiraiModel {
     inner: RustMoiraiModel,
@@ -1045,7 +1043,7 @@ impl MoiraiModel {
 }
 
 use zsfm_moirai2::config::Moirai2Config;
-use zsfm_moirai2::infer::Moirai2Model as RustMoirai2Model;
+use zsfm_moirai2::infer::BurnMoirai2Model as RustMoirai2Model;
 #[pyclass]
 struct Moirai2Model {
     inner: RustMoirai2Model,
@@ -1071,7 +1069,7 @@ impl Moirai2Model {
 }
 
 use zsfm_flowstate::config::FlowStateConfig;
-use zsfm_flowstate::infer::FlowStateModel as RustFlowStateModel;
+use zsfm_flowstate::infer::BurnFlowStateModel as RustFlowStateModel;
 #[pyclass]
 struct FlowStateModel {
     inner: RustFlowStateModel,
@@ -1090,9 +1088,7 @@ impl FlowStateModel {
         })?;
         let cfg = FlowStateConfig::from_json(&s)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        let inner = RustFlowStateModel::builder(&p)
-            .config_from(&cfg)
-            .build()
+        let inner = RustFlowStateModel::load(&p, zsfm_flowstate::infer::InferConfig::from(&cfg))
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("load FlowState {gguf}: {e}"))
             })?;
@@ -1103,7 +1099,7 @@ impl FlowStateModel {
             .inner
             .forecast(&context, horizon)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        let median_idx = self.inner.config.median_index();
+        let median_idx = self.inner.median_index();
         Ok(qmat[median_idx].clone())
     }
 
@@ -1116,12 +1112,12 @@ impl FlowStateModel {
 
     /// The quantile levels each row of `forecast_quantiles()` corresponds to (from config.json).
     fn quantiles(&self) -> Vec<f32> {
-        self.inner.config.quantiles().to_vec()
+        self.inner.quantiles().to_vec()
     }
 }
 
 use zsfm_tirex::config::TiRexConfig;
-use zsfm_tirex::infer::TiRexModel as RustTirexModel;
+use zsfm_tirex::infer::BurnTiRexModel as RustTirexModel;
 #[pyclass]
 struct TirexModel {
     inner: RustTirexModel,
@@ -1139,7 +1135,7 @@ impl TirexModel {
     }
     /// Returns the median (q0.5) forecast. Despite its old internal name, the second
     /// element of the underlying Rust `forecast()` tuple is the median quantile row,
-    /// not a separate mean statistic — `zsfm_tirex::infer::TiRexModel::forecast` docs it
+    /// not a separate mean statistic — `zsfm_tirex::infer::BurnTiRexModel::forecast` docs it
     /// explicitly.
     fn forecast(&self, context: Vec<f32>, horizon: usize) -> PyResult<Vec<f32>> {
         let (_quantiles, median) = self
@@ -1165,7 +1161,7 @@ impl TirexModel {
 }
 
 use zsfm_chronos::config::Chronos2Config;
-use zsfm_chronos::infer::ChronosModel as RustChronosModel;
+use zsfm_chronos::infer::BurnChronosModel as RustChronosModel;
 
 #[pyclass]
 struct ChronosModel {
@@ -1185,12 +1181,11 @@ impl ChronosModel {
         })?;
         let cfg = Chronos2Config::from_json(&s)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        let inner = RustChronosModel::builder(&gguf_path)
-            .config_from(&cfg)
-            .build()
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("load Chronos {gguf}: {e}"))
-            })?;
+        let inner =
+            RustChronosModel::load(&gguf_path, zsfm_chronos::infer::InferConfig::from(&cfg))
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("load Chronos {gguf}: {e}"))
+                })?;
         Ok(Self { inner })
     }
     fn forecast(&self, context: Vec<f32>, horizon: usize) -> PyResult<Vec<f32>> {
@@ -1198,7 +1193,7 @@ impl ChronosModel {
             .inner
             .forecast(&context, horizon)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        let levels = self.inner.config.quantiles();
+        let levels = self.inner.quantiles();
         let median_idx = levels
             .iter()
             .position(|&q| (q - 0.5).abs() < 1e-6)
@@ -1213,7 +1208,7 @@ impl ChronosModel {
         Ok(qmat)
     }
     fn quantiles(&self) -> Vec<f32> {
-        self.inner.config.quantiles().to_vec()
+        self.inner.quantiles().to_vec()
     }
 }
 
@@ -1222,7 +1217,7 @@ impl ChronosModel {
 // ---------------------------------------------------------------------------
 
 use zsfm_mitra::config::MitraConfig;
-use zsfm_mitra::MitraModel as RustMitraModel;
+use zsfm_mitra::BurnMitraModel as RustMitraModel;
 #[pyclass]
 struct MitraModel {
     inner: RustMitraModel,
@@ -1290,7 +1285,7 @@ impl MitraModel {
 }
 
 use zsfm_tabdpt::config::TabDptConfig;
-use zsfm_tabdpt::TabDptModel as RustTabDptModel;
+use zsfm_tabdpt::BurnTabDptModel as RustTabDptModel;
 #[pyclass]
 struct TabDptModel {
     inner: RustTabDptModel,
@@ -1334,7 +1329,7 @@ impl TabDptModel {
 }
 
 use zsfm_tabicl::config::TabIclConfig;
-use zsfm_tabicl::TabIclModel as RustTabIclModel;
+use zsfm_tabicl::BurnTabIclModel as RustTabIclModel;
 #[pyclass]
 struct TabIclModel {
     inner: RustTabIclModel,
@@ -1366,7 +1361,7 @@ impl TabIclModel {
 }
 
 use zsfm_tabpfn::config::TabPfnConfig;
-use zsfm_tabpfn::TabPfnModel as RustTabPfnModel;
+use zsfm_tabpfn::BurnTabPfnModel as RustTabPfnModel;
 #[pyclass]
 struct TabPfnModel {
     inner: RustTabPfnModel,
@@ -1398,7 +1393,7 @@ impl TabPfnModel {
 }
 
 use zsfm_tabfm::config::TabFMConfig;
-use zsfm_tabfm::TabFMModel as RustTabFMModel;
+use zsfm_tabfm::BurnTabFMModel as RustTabFMModel;
 #[pyclass]
 struct TabFmModel {
     inner: RustTabFMModel,
@@ -1429,12 +1424,9 @@ impl TabFmModel {
         let cfg = TabFMConfig::from_json(&s)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         let is_classifier = cfg.is_classifier;
-        let inner = RustTabFMModel::builder(&p)
-            .config_from(&cfg)
-            .build()
-            .map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("load TabFM {gguf}: {e}"))
-            })?;
+        let inner = RustTabFMModel::load(&p, &cfg).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("load TabFM {gguf}: {e}"))
+        })?;
         Ok(Self {
             inner,
             is_classifier,

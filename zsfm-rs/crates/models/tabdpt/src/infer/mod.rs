@@ -1,153 +1,169 @@
-//! TabDPT inference engine — zero-shot forward pass only, single-pass (no ensembling; upstream
-//! defaults to averaging 8 class-permuted passes, but `n_ensembles=1` is a genuine, documented
-//! mode in the reference implementation, not a shortcut — see `classifier.py`'s
-//! `predict()`/`ensemble_predict_proba()` split).
+//! TabDPT inference on the Burn backend (Flex CPU).
 //!
-//! Architecture: 32-layer transformer over `[thinking rows][support rows][query rows]`. Each
-//! layer's attention lets every position attend to the context (thinking + support) only, with
-//! a per-layer y-embedding (a small MLP, re-run per layer) folded into V, RMSNorm'd Q/K, a
-//! length-adaptive temperature scale, and a sigmoid output gate per head. One checkpoint serves
-//! both tasks — the head produces `max_num_classes + regression_bin_count` outputs; classifier
-//! reads the first `n_classes`, regressor reads the rest as a binned distribution over
-//! `[regression_bin_min, regression_bin_max]`.
+//! Outer impute/scale/pad, clip + normalize, thinking rows, per-layer
+//! y-encoders, gated RMSNorm attention with length-adaptive temperature,
+//! SwiGLU-split FFN, binned head, with weights loaded straight from GGUF
+//! via [`zsfm_burn::GgufWeights`].
 
-use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device, Tensor, D};
+use burn::tensor::{activation, Device, Tensor, TensorData};
+use zsfm_burn::linear::{burn_linear_bias, burn_linear_nobias};
+use zsfm_burn::norm::{burn_layer_norm_nd, burn_rms_norm_nd};
+use zsfm_burn::{open_gguf_weights, GgufWeights};
 
 use crate::config::TabDptConfig;
 
-pub mod burn;
-
-// ---------------------------------------------------------------------------
-// Weight structs
-// ---------------------------------------------------------------------------
-
-struct BlockW {
-    attn_norm_w: Tensor,
-    attn_norm_b: Tensor,
-    ff_norm_w: Tensor,
-    ff_norm_b: Tensor,
-    q_proj_w: Tensor,
-    k_proj_w: Tensor,
-    v_proj_w: Tensor,
-    out_proj_w: Tensor,
-    q_gate_w: Tensor,
-    q_norm_w: Tensor,
-    k_norm_w: Tensor,
-    ff_up_w: Tensor,
-    ff_down_w: Tensor,
-}
-
-struct YEncW {
-    fc1_w: Tensor,
-    fc1_b: Tensor,
-    fc2_w: Tensor,
-    fc2_b: Tensor,
-}
-
-pub struct TabDptModel {
-    device: Device,
-    config: TabDptConfig,
-    encoder_w: Tensor,
-    encoder_b: Tensor,
-    thinking_embed: Tensor,
-    blocks: Vec<BlockW>,
-    y_encoders: Vec<YEncW>,
-    head_fc1_w: Tensor,
-    head_fc1_b: Tensor,
-    head_fc2_w: Tensor,
-    head_fc2_b: Tensor,
-}
-
-const LN_EPS: f64 = 1e-5;
-const RMS_EPS: f64 = 1e-8;
+const LN_EPS: f32 = 1e-5;
+const RMS_EPS: f32 = 1e-8;
 const CLIP_N_SIGMA: f32 = 8.0;
 
-// ---------------------------------------------------------------------------
-// GGUF loading
-// ---------------------------------------------------------------------------
-
-fn load_t(
-    content: &gguf_file::Content,
-    reader: &mut (impl Read + Seek),
-    name: &str,
-    device: &Device,
-) -> Result<Tensor> {
-    zsfm_nn::load_tensor(content, reader, name, device, DType::F32)
+fn device() -> Device {
+    Device::flex()
 }
 
-impl TabDptModel {
-    pub fn load(gguf_path: &Path, config: TabDptConfig) -> Result<Self> {
-        let device = Device::Cpu;
-        let file = std::fs::File::open(gguf_path)
-            .with_context(|| format!("open {}", gguf_path.display()))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, file);
-        let content = gguf_file::Content::read(&mut reader).context("parse GGUF header")?;
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
+}
 
-        let encoder_w = load_t(&content, &mut reader, "encoder.weight", &device)?;
-        let encoder_b = load_t(&content, &mut reader, "encoder.bias", &device)?;
-        let thinking_embed = load_t(&content, &mut reader, "thinking_embed", &device)?;
+fn load_v(weights: &GgufWeights, name: &str) -> Result<Tensor<1>> {
+    weights.load_1d(name)
+}
+
+fn linear(x: Tensor<2>, w: Tensor<2>, b: Tensor<1>) -> Tensor<2> {
+    burn_linear_bias(x, w, b)
+}
+
+fn linear_o<const D: usize>(x: Tensor<D>, w: Tensor<2>, b: Option<Tensor<1>>) -> Tensor<D> {
+    zsfm_burn::linear::burn_linear_nd(x, w, b)
+}
+
+fn linear_nd<const D: usize>(x: Tensor<D>, w: Tensor<2>, b: Option<Tensor<1>>) -> Tensor<D> {
+    zsfm_burn::linear::burn_linear_nd(x, w, b)
+}
+
+fn layer_norm<const D: usize>(x: Tensor<D>, w: Tensor<1>, b: Tensor<1>) -> Tensor<D> {
+    burn_layer_norm_nd(x, w, b, LN_EPS)
+}
+
+fn layer_norm_no_affine(x: Tensor<2>) -> Tensor<2> {
+    zsfm_burn::norm::burn_layer_norm_no_affine(x, LN_EPS)
+}
+
+fn rms<const D: usize>(x: Tensor<D>, w: Tensor<1>) -> Tensor<D> {
+    burn_rms_norm_nd(x, w, RMS_EPS)
+}
+
+fn gelu<const D: usize>(x: Tensor<D>) -> Tensor<D> {
+    activation::gelu(x)
+}
+
+fn silu<const D: usize>(x: Tensor<D>) -> Tensor<D> {
+    activation::silu(x)
+}
+
+fn sigmoid<const D: usize>(x: Tensor<D>) -> Tensor<D> {
+    activation::sigmoid(x)
+}
+
+fn softmax_last<const D: usize>(x: Tensor<D>) -> Tensor<D> {
+    activation::softmax(x, D - 1)
+}
+
+fn to_host<const D: usize>(t: &Tensor<D>) -> Result<Vec<f32>> {
+    t.to_data()
+        .try_to_vec()
+        .map_err(|e| anyhow::anyhow!("{e:?}"))
+}
+
+struct BurnBlockW {
+    attn_norm_w: Tensor<1>,
+    attn_norm_b: Tensor<1>,
+    ff_norm_w: Tensor<1>,
+    ff_norm_b: Tensor<1>,
+    q_proj_w: Tensor<2>,
+    k_proj_w: Tensor<2>,
+    v_proj_w: Tensor<2>,
+    out_proj_w: Tensor<2>,
+    q_gate_w: Tensor<2>,
+    q_norm_w: Tensor<1>,
+    k_norm_w: Tensor<1>,
+    ff_up_w: Tensor<2>,
+    ff_down_w: Tensor<2>,
+}
+
+struct BurnYEncW {
+    fc1_w: Tensor<2>,
+    fc1_b: Tensor<1>,
+    fc2_w: Tensor<2>,
+    fc2_b: Tensor<1>,
+}
+
+pub struct BurnTabDptModel {
+    config: TabDptConfig,
+    encoder_w: Tensor<2>,
+    encoder_b: Tensor<1>,
+    thinking_embed: Tensor<2>,
+    blocks: Vec<BurnBlockW>,
+    y_encoders: Vec<BurnYEncW>,
+    head_fc1_w: Tensor<2>,
+    head_fc1_b: Tensor<1>,
+    head_fc2_w: Tensor<2>,
+    head_fc2_b: Tensor<1>,
+}
+
+impl BurnTabDptModel {
+    pub fn load(gguf_path: &Path, config: TabDptConfig) -> Result<Self> {
+        let weights = open_gguf_weights(gguf_path)
+            .with_context(|| format!("open {}", gguf_path.display()))?;
+
+        let encoder_w = load_t(&weights, "encoder.weight")?;
+        let encoder_b = load_v(&weights, "encoder.bias")?;
+        let thinking_embed = load_t(&weights, "thinking_embed")?;
 
         let mut blocks = Vec::with_capacity(config.n_layers);
         let mut y_encoders = Vec::with_capacity(config.n_layers);
         for n in 0..config.n_layers {
             let p = |s: &str| format!("blk.{n}.{s}");
-            blocks.push(BlockW {
-                attn_norm_w: load_t(&content, &mut reader, &p("attn_norm.weight"), &device)?,
-                attn_norm_b: load_t(&content, &mut reader, &p("attn_norm.bias"), &device)?,
-                ff_norm_w: load_t(&content, &mut reader, &p("ff_norm.weight"), &device)?,
-                ff_norm_b: load_t(&content, &mut reader, &p("ff_norm.bias"), &device)?,
-                q_proj_w: load_t(&content, &mut reader, &p("q_proj.weight"), &device)?,
-                k_proj_w: load_t(&content, &mut reader, &p("k_proj.weight"), &device)?,
-                v_proj_w: load_t(&content, &mut reader, &p("v_proj.weight"), &device)?,
-                out_proj_w: load_t(&content, &mut reader, &p("out_proj.weight"), &device)?,
-                q_gate_w: load_t(&content, &mut reader, &p("q_gate.weight"), &device)?,
-                q_norm_w: load_t(&content, &mut reader, &p("q_norm.weight"), &device)?,
-                k_norm_w: load_t(&content, &mut reader, &p("k_norm.weight"), &device)?,
-                ff_up_w: load_t(&content, &mut reader, &p("ff_up.weight"), &device)?,
-                ff_down_w: load_t(&content, &mut reader, &p("ff_down.weight"), &device)?,
+            blocks.push(BurnBlockW {
+                attn_norm_w: load_v(&weights, &p("attn_norm.weight"))?,
+                attn_norm_b: load_v(&weights, &p("attn_norm.bias"))?,
+                ff_norm_w: load_v(&weights, &p("ff_norm.weight"))?,
+                ff_norm_b: load_v(&weights, &p("ff_norm.bias"))?,
+                q_proj_w: load_t(&weights, &p("q_proj.weight"))?,
+                k_proj_w: load_t(&weights, &p("k_proj.weight"))?,
+                v_proj_w: load_t(&weights, &p("v_proj.weight"))?,
+                out_proj_w: load_t(&weights, &p("out_proj.weight"))?,
+                q_gate_w: load_t(&weights, &p("q_gate.weight"))?,
+                q_norm_w: load_v(&weights, &p("q_norm.weight"))?,
+                k_norm_w: load_v(&weights, &p("k_norm.weight"))?,
+                ff_up_w: load_t(&weights, &p("ff_up.weight"))?,
+                ff_down_w: load_t(&weights, &p("ff_down.weight"))?,
             });
-
             let yp = |s: &str| format!("y_enc.{n}.{s}");
-            y_encoders.push(YEncW {
-                fc1_w: load_t(&content, &mut reader, &yp("fc1.weight"), &device)?,
-                fc1_b: load_t(&content, &mut reader, &yp("fc1.bias"), &device)?,
-                fc2_w: load_t(&content, &mut reader, &yp("fc2.weight"), &device)?,
-                fc2_b: load_t(&content, &mut reader, &yp("fc2.bias"), &device)?,
+            y_encoders.push(BurnYEncW {
+                fc1_w: load_t(&weights, &yp("fc1.weight"))?,
+                fc1_b: load_v(&weights, &yp("fc1.bias"))?,
+                fc2_w: load_t(&weights, &yp("fc2.weight"))?,
+                fc2_b: load_v(&weights, &yp("fc2.bias"))?,
             });
         }
 
-        let head_fc1_w = load_t(&content, &mut reader, "head_fc1.weight", &device)?;
-        let head_fc1_b = load_t(&content, &mut reader, "head_fc1.bias", &device)?;
-        let head_fc2_w = load_t(&content, &mut reader, "head_fc2.weight", &device)?;
-        let head_fc2_b = load_t(&content, &mut reader, "head_fc2.bias", &device)?;
-
         Ok(Self {
-            device,
             config,
             encoder_w,
             encoder_b,
             thinking_embed,
             blocks,
             y_encoders,
-            head_fc1_w,
-            head_fc1_b,
-            head_fc2_w,
-            head_fc2_b,
+            head_fc1_w: load_t(&weights, "head_fc1.weight")?,
+            head_fc1_b: load_v(&weights, "head_fc1.bias")?,
+            head_fc2_w: load_t(&weights, "head_fc2.weight")?,
+            head_fc2_b: load_v(&weights, "head_fc2.bias")?,
         })
     }
 
-    // -----------------------------------------------------------------------
-    // Prediction
-    // -----------------------------------------------------------------------
-
-    /// Zero-shot classification. `y_support` are class indices `0..n_classes`. Returns
-    /// probabilities `[n_query][n_classes]` — note the reference implementation applies
-    /// `softmax(log_softmax(logits))` (not a plain single softmax); replicated exactly.
     pub fn predict_classification(
         &self,
         x_support: &[Vec<f32>],
@@ -157,22 +173,19 @@ impl TabDptModel {
     ) -> Result<Vec<Vec<f32>>> {
         let (x_s, x_q) = preprocess_x_outer(x_support, x_query, self.config.max_num_features);
         let y_s: Vec<f32> = y_support.iter().map(|&c| c as f32).collect();
-
-        let out = self.forward(&x_s, &y_s, &x_q)?; // (n_q, max_num_classes + regression_bin_count)
+        let out = self.forward(&x_s, &y_s, &x_q)?;
         let n_q = x_query.len();
         let width = self.config.max_num_classes + self.config.regression_bin_count;
-        let flat: Vec<f32> = out.flatten_all()?.to_vec1()?;
-
+        let flat: Vec<f32> = to_host(&out)?;
         let mut result = Vec::with_capacity(n_q);
         for i in 0..n_q {
             let row = &flat[i * width..i * width + n_classes];
             let log_probs = log_softmax(row);
-            result.push(softmax(&log_probs));
+            result.push(softmax_host(&log_probs));
         }
         Ok(result)
     }
 
-    /// Zero-shot regression. Returns predicted values in `y_support`'s original scale.
     pub fn predict_regression(
         &self,
         x_support: &[Vec<f32>],
@@ -180,7 +193,6 @@ impl TabDptModel {
         x_query: &[Vec<f32>],
     ) -> Result<Vec<f32>> {
         let (x_s, x_q) = preprocess_x_outer(x_support, x_query, self.config.max_num_features);
-
         let mean_y: f64 = y_support.iter().map(|&v| v as f64).sum::<f64>() / y_support.len() as f64;
         let var_y: f64 = y_support
             .iter()
@@ -192,52 +204,44 @@ impl TabDptModel {
             .iter()
             .map(|&v| ((v as f64 - mean_y) / std_y) as f32)
             .collect();
-
         let out = self.forward(&x_s, &y_s, &x_q)?;
         let n_q = x_query.len();
         let width = self.config.max_num_classes + self.config.regression_bin_count;
-        let flat: Vec<f32> = out.flatten_all()?.to_vec1()?;
-
+        let flat: Vec<f32> = to_host(&out)?;
         let n_bins = self.config.regression_bin_count;
-        let bin_lo = self.config.regression_bin_min;
-        let bin_hi = self.config.regression_bin_max;
-        let bin_width = (bin_hi - bin_lo) / n_bins as f32;
+        let bin_width =
+            (self.config.regression_bin_max - self.config.regression_bin_min) / n_bins as f32;
         let bin_centers: Vec<f32> = (0..n_bins)
-            .map(|i| bin_lo + (i as f32 + 0.5) * bin_width)
+            .map(|i| self.config.regression_bin_min + (i as f32 + 0.5) * bin_width)
             .collect();
-
         let mut result = Vec::with_capacity(n_q);
         for i in 0..n_q {
             let row = &flat[i * width + self.config.max_num_classes..i * width + width];
-            let probs = softmax(row);
+            let probs = softmax_host(row);
             let expectation: f32 = probs.iter().zip(&bin_centers).map(|(p, c)| p * c).sum();
             result.push((expectation as f64 * std_y + mean_y) as f32);
         }
         Ok(result)
     }
 
-    /// `x_support`/`x_query` are already outer-preprocessed (imputed, standard-scaled, padded to
-    /// `max_num_features`). `y_support` is already the scalar fed to the model (class index for
-    /// classification, z-scored target for regression). Returns `[n_query][max_num_classes +
-    /// regression_bin_count]` raw head outputs.
     fn forward(
         &self,
         x_support: &[Vec<f32>],
         y_support: &[f32],
         x_query: &[Vec<f32>],
-    ) -> Result<Tensor> {
+    ) -> Result<Tensor<2>> {
+        let dev = device();
         let n_s = x_support.len();
         let n_q = x_query.len();
         let n_feat = self.config.max_num_features;
         let n_think = self.config.n_thinking_rows;
         let ctx_len = n_think + n_s;
 
-        // Combine support+query rows, model-internal clip/normalize (context-fit, applied to all).
         let mut all_rows: Vec<Vec<f32>> = Vec::with_capacity(n_s + n_q);
         all_rows.extend_from_slice(x_support);
         all_rows.extend_from_slice(x_query);
         let all_rows = clip_outliers(all_rows, n_s, n_feat, CLIP_N_SIGMA);
-        let (all_rows, _mean, _std) = normalize_data(all_rows, n_s, n_feat);
+        let (all_rows, _m, _s) = normalize_data(all_rows, n_s, n_feat);
         let mut all_rows = clip_outliers(all_rows, n_s, n_feat, CLIP_N_SIGMA);
         for row in &mut all_rows {
             for v in row.iter_mut() {
@@ -246,104 +250,88 @@ impl TabDptModel {
                 }
             }
         }
-
         let flat: Vec<f32> = all_rows.into_iter().flatten().collect();
-        let x_t = Tensor::from_vec(flat, (n_s + n_q, n_feat), &self.device)?;
-        let x_enc = zsfm_nn::linear_bias(&x_t, &self.encoder_w, &self.encoder_b)?; // (T, dim)
-        let x_enc = layer_norm_no_affine(&x_enc, LN_EPS)?;
+        let x_t = Tensor::<2>::from_data(TensorData::new(flat, [n_s + n_q, n_feat]), &dev);
+        let x_enc = linear(x_t, self.encoder_w.clone(), self.encoder_b.clone());
+        let x_enc = layer_norm_no_affine(x_enc);
+        let mut src = Tensor::cat(vec![self.thinking_embed.clone(), x_enc], 0);
 
-        let mut src = Tensor::cat(&[&self.thinking_embed, &x_enc], 0)?; // (n_think+T, dim)
-
-        let y_support_t = Tensor::from_vec(y_support.to_vec(), (n_s, 1), &self.device)?;
-        let zeros_think_emb = Tensor::zeros(
-            (n_think, self.config.y_encoder_dim),
-            DType::F32,
-            &self.device,
-        )?;
-
+        let y_support_t =
+            Tensor::<2>::from_data(TensorData::new(y_support.to_vec(), [n_s, 1]), &dev);
+        let zeros_think_emb = Tensor::<2>::zeros([n_think, self.config.y_encoder_dim], &dev);
         let kappa = self.config.kappa();
         let beta = attention_beta(kappa, ctx_len, self.config.base_len, self.config.max_len);
-
         for (blk, yenc) in self.blocks.iter().zip(self.y_encoders.iter()) {
-            // Encode the *actual* support targets first, then prepend a true zero embedding for
-            // the thinking rows — NOT the other way around: the MLP has biases, so `MLP(0)` is
-            // not the zero vector, and the reference concatenates zeros only *after* encoding.
-            let y_h = zsfm_nn::linear_bias(&y_support_t, &yenc.fc1_w, &yenc.fc1_b)?.gelu_erf()?;
-            let y_h = zsfm_nn::linear_bias(&y_h, &yenc.fc2_w, &yenc.fc2_b)?;
-            let y_support_emb = layer_norm_no_affine(&y_h, LN_EPS)?; // (n_s, y_encoder_dim)
-            let y_emb = Tensor::cat(&[&zeros_think_emb, &y_support_emb], 0)?; // (ctx_len, y_encoder_dim)
-
-            src = layer_forward(&src, &y_emb, ctx_len, blk, self.config.n_heads, beta)?;
+            let y_h = gelu(linear(
+                y_support_t.clone(),
+                yenc.fc1_w.clone(),
+                yenc.fc1_b.clone(),
+            ));
+            let y_h = linear(y_h, yenc.fc2_w.clone(), yenc.fc2_b.clone());
+            let y_support_emb = layer_norm_no_affine(y_h);
+            let y_emb = Tensor::cat(vec![zeros_think_emb.clone(), y_support_emb], 0);
+            src = layer_forward(src, y_emb, ctx_len, blk, self.config.n_heads, beta as f32);
         }
-
-        let query_out = src.narrow(0, ctx_len, n_q)?; // (n_q, dim)
-        let h = zsfm_nn::linear_bias(&query_out, &self.head_fc1_w, &self.head_fc1_b)?.gelu_erf()?;
-        zsfm_nn::linear_bias(&h, &self.head_fc2_w, &self.head_fc2_b).map_err(anyhow::Error::from)
+        let query_out: Tensor<2> = src.narrow(0, ctx_len, n_q);
+        let h = gelu(linear(
+            query_out,
+            self.head_fc1_w.clone(),
+            self.head_fc1_b.clone(),
+        ));
+        Ok(linear_o(
+            h,
+            self.head_fc2_w.clone(),
+            Some(self.head_fc2_b.clone()),
+        ))
     }
 }
 
-/// One `TransformerEncoderLayer`: attn_norm -> gated RMSNorm'd attention (context-only K/V,
-/// all-position Q) -> residual -> ff_norm -> SwiGLU -> residual.
 fn layer_forward(
-    src: &Tensor,
-    y_emb: &Tensor,
+    src: Tensor<2>,
+    y_emb: Tensor<2>,
     ctx_len: usize,
-    blk: &BlockW,
+    blk: &BurnBlockW,
     n_heads: usize,
-    beta: f64,
-) -> Result<Tensor> {
-    let dim = src.dim(1)?;
+    beta: f32,
+) -> Tensor<2> {
+    let dim = src.dims()[1];
     let head_dim = dim / n_heads;
-    let l = src.dim(0)?;
-
-    let h = zsfm_nn::layer_norm(src, &blk.attn_norm_w, &blk.attn_norm_b, LN_EPS)?;
-    let q = zsfm_nn::linear_nobias(&h, &blk.q_proj_w)?; // (L, dim)
-    let gate = candle_nn::ops::sigmoid(&zsfm_nn::linear_nobias(&q, &blk.q_gate_w)?)?; // (L, n_heads)
-
-    let h_ctx = h.narrow(0, 0, ctx_len)?;
-    let k = zsfm_nn::linear_nobias(&h_ctx, &blk.k_proj_w)?; // (ctx_len, dim)
-    let v_in = Tensor::cat(&[&h_ctx, y_emb], 1)?; // (ctx_len, dim + y_encoder_dim)
-    let v = zsfm_nn::linear_nobias(&v_in, &blk.v_proj_w)?; // (ctx_len, dim)
-
-    let q = q
-        .reshape((l, n_heads, head_dim))?
-        .permute((1, 0, 2))?
-        .contiguous()?; // (h, L, hd)
-    let k = k
-        .reshape((ctx_len, n_heads, head_dim))?
-        .permute((1, 0, 2))?
-        .contiguous()?;
-    let v = v
-        .reshape((ctx_len, n_heads, head_dim))?
-        .permute((1, 0, 2))?
-        .contiguous()?;
-
-    let q = zsfm_nn::rms_norm(&q, Some(&blk.q_norm_w), RMS_EPS)?;
-    let k = zsfm_nn::rms_norm(&k, Some(&blk.k_norm_w), RMS_EPS)?;
-
-    let scale = beta / (head_dim as f64).sqrt();
-    let scores = (q.matmul(&k.transpose(1, 2)?)? * scale)?; // (h, L, ctx_len)
-    let attn = candle_nn::ops::softmax_last_dim(&scores)?;
-    let out = attn.matmul(&v)?; // (h, L, hd)
-    let out = out.permute((1, 0, 2))?.contiguous()?; // (L, h, hd)
-
-    let gate = gate.reshape((l, n_heads, 1))?;
-    let out = out.broadcast_mul(&gate)?.reshape((l, dim))?;
-    let attn_out = zsfm_nn::linear_nobias(&out, &blk.out_proj_w)?;
-
-    let x1 = (src + attn_out)?;
-    let ff_in = zsfm_nn::layer_norm(&x1, &blk.ff_norm_w, &blk.ff_norm_b, LN_EPS)?;
-    let up = zsfm_nn::linear_nobias(&ff_in, &blk.ff_up_w)?;
-    let ff_dim2 = up.dim(1)? / 2;
-    let u = up.narrow(1, 0, ff_dim2)?;
-    let v_ff = up.narrow(1, ff_dim2, ff_dim2)?;
-    let ff_out = zsfm_nn::linear_nobias(&(u.silu()? * v_ff)?, &blk.ff_down_w)?;
-
-    Ok((x1 + ff_out)?)
+    let l = src.dims()[0];
+    let h = layer_norm(
+        src.clone(),
+        blk.attn_norm_w.clone(),
+        blk.attn_norm_b.clone(),
+    );
+    let q = linear_nd(h.clone(), blk.q_proj_w.clone(), None);
+    let gate = sigmoid(linear_nd(q.clone(), blk.q_gate_w.clone(), None));
+    let h_ctx: Tensor<2> = h.narrow(0, 0, ctx_len);
+    let k = linear_nd(h_ctx.clone(), blk.k_proj_w.clone(), None);
+    let v_in = Tensor::cat(vec![h_ctx, y_emb], 1);
+    let v = linear_nd(v_in, blk.v_proj_w.clone(), None);
+    let q: Tensor<3> = q.reshape([l, n_heads, head_dim]).permute([1, 0, 2]);
+    let k: Tensor<3> = k.reshape([ctx_len, n_heads, head_dim]).permute([1, 0, 2]);
+    let v: Tensor<3> = v.reshape([ctx_len, n_heads, head_dim]).permute([1, 0, 2]);
+    let q = rms(q, blk.q_norm_w.clone());
+    let k = rms(k, blk.k_norm_w.clone());
+    let scale = beta / (head_dim as f32).sqrt();
+    let scores = q.matmul(k.transpose()).mul_scalar(scale);
+    let attn = softmax_last(scores);
+    let out = attn.matmul(v);
+    let out: Tensor<3> = out.permute([1, 0, 2]);
+    let gate: Tensor<3> = gate.reshape([l, n_heads, 1]);
+    let out = out * gate;
+    let out: Tensor<2> = out.reshape([l, dim]);
+    let attn_out = linear_nd(out, blk.out_proj_w.clone(), None);
+    let x1 = src + attn_out;
+    let ff_in = layer_norm(x1.clone(), blk.ff_norm_w.clone(), blk.ff_norm_b.clone());
+    let up = linear_nd(ff_in, blk.ff_up_w.clone(), None);
+    let ff_dim2 = up.dims()[1] / 2;
+    let u: Tensor<2> = up.clone().narrow(1, 0, ff_dim2);
+    let v_ff: Tensor<2> = up.narrow(1, ff_dim2, ff_dim2);
+    let ff_out = linear_nd(silu(u) * v_ff, blk.ff_down_w.clone(), None);
+    x1 + ff_out
 }
 
-/// `1 + kappa * max(0, ln(min(ctx_len, max_len) / base_len))`, or `1.0` if attention scaling is
-/// disabled (`base_len == max_len`).
 fn attention_beta(kappa: Option<f64>, ctx_len: usize, base_len: usize, max_len: usize) -> f64 {
     match kappa {
         None => 1.0,
@@ -355,8 +343,8 @@ fn attention_beta(kappa: Option<f64>, ctx_len: usize, base_len: usize, max_len: 
     }
 }
 
-fn layer_norm_no_affine(x: &Tensor, eps: f64) -> Result<Tensor> {
-    zsfm_nn::layer_norm_no_affine(x, eps)
+fn softmax_host(logits: &[f32]) -> Vec<f32> {
+    zsfm_core::softmax(logits)
 }
 
 fn log_softmax(logits: &[f32]) -> Vec<f32> {
@@ -365,22 +353,12 @@ fn log_softmax(logits: &[f32]) -> Vec<f32> {
     logits.iter().map(|&v| v - max - log_sum_exp).collect()
 }
 
-fn softmax(logits: &[f32]) -> Vec<f32> {
-    zsfm_nn::softmax_host(logits)
-}
-
-// ---------------------------------------------------------------------------
-// Outer preprocessing (SimpleImputer(mean) + StandardScaler, fit on support, applied to both,
-// then zero-padded to `max_num_features`)
-// ---------------------------------------------------------------------------
-
 fn preprocess_x_outer(
     x_support: &[Vec<f32>],
     x_query: &[Vec<f32>],
     max_features: usize,
 ) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
     let n_feat = x_support[0].len();
-
     let mut impute_mean = vec![0f32; n_feat];
     for f in 0..n_feat {
         let mut sum = 0f64;
@@ -405,8 +383,6 @@ fn preprocess_x_outer(
     };
     let support_imputed: Vec<Vec<f32>> = x_support.iter().map(|r| impute(r)).collect();
     let query_imputed: Vec<Vec<f32>> = x_query.iter().map(|r| impute(r)).collect();
-
-    // StandardScaler stats, fit on the (now NaN-free) support data.
     let n_s = support_imputed.len();
     let mut scaler_mean = vec![0f32; n_feat];
     let mut scaler_std = vec![0f32; n_feat];
@@ -418,10 +394,8 @@ fn preprocess_x_outer(
             .sum::<f64>()
             / n_s as f64;
         scaler_mean[f] = mean as f32;
-        // sklearn StandardScaler: zero-variance columns get scale=1 (no-op) instead of divide-by-zero.
         scaler_std[f] = if var == 0.0 { 1.0 } else { var.sqrt() as f32 };
     }
-
     let scale_and_pad = |rows: &[Vec<f32>]| -> Vec<Vec<f32>> {
         rows.iter()
             .map(|row| {
@@ -433,17 +407,11 @@ fn preprocess_x_outer(
             })
             .collect()
     };
-
     (
         scale_and_pad(&support_imputed),
         scale_and_pad(&query_imputed),
     )
 }
-
-// ---------------------------------------------------------------------------
-// Model-internal preprocessing (utils.py's `clip_outliers`/`normalize_data`), fit on the
-// context (first `n_ctx` rows), applied to all rows, per feature column.
-// ---------------------------------------------------------------------------
 
 fn clip_outliers(
     mut rows: Vec<Vec<f32>>,
@@ -460,10 +428,6 @@ fn clip_outliers(
         if ctx_vals.is_empty() {
             continue;
         }
-        // `maskstd` recomputes its own mean from whatever mask it's given each call — the second
-        // pass's std is centered on the *refined* subset's mean, not the original mean. The
-        // final clip bounds, though, stay centered on the *original* mean (matches `utils.py`
-        // exactly: `torch.clip(data, mean - cutoff, mean + cutoff)` uses the first `mean`).
         let mean = ctx_vals.iter().sum::<f32>() / ctx_vals.len() as f32;
         let std1 = population_std(&ctx_vals, mean);
         let cutoff1 = n_sigma * std1;
@@ -527,4 +491,133 @@ fn population_std(vals: &[f32], mean: f32) -> f32 {
     }
     let var = vals.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / (vals.len() - 1) as f32;
     var.sqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zsfm_gguf::{GGMLType, GGUFMetaValue, GGUFWriter};
+
+    fn pseudo(n: usize, seed: u64) -> Vec<f32> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn tiny_config() -> TabDptConfig {
+        TabDptConfig {
+            dim: 8,
+            n_layers: 1,
+            n_heads: 2,
+            ff_dim: 8,
+            y_encoder_dim: 4,
+            max_num_classes: 2,
+            regression_bin_count: 4,
+            regression_bin_min: -2.0,
+            regression_bin_max: 2.0,
+            max_num_features: 4,
+            base_len: 64,
+            max_len: 64,
+            n_thinking_rows: 2,
+        }
+    }
+
+    fn put2(w: &mut GGUFWriter, name: &str, rows: usize, cols: usize, seed: &mut u64, scale: f32) {
+        *seed += 1;
+        let data: Vec<f32> = pseudo(rows * cols, *seed)
+            .iter()
+            .map(|v| v * scale)
+            .collect();
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        w.add_tensor(name, vec![cols as u64, rows as u64], GGMLType::F32, bytes);
+    }
+
+    fn put1(w: &mut GGUFWriter, name: &str, n: usize, seed: &mut u64) {
+        *seed += 1;
+        let bytes: Vec<u8> = pseudo(n, *seed)
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        w.add_tensor(name, vec![n as u64], GGMLType::F32, bytes);
+    }
+
+    #[test]
+    fn burn_classification_golden() {
+        let dir = std::env::temp_dir().join(format!("tabdpt-burn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf");
+        let mut w = GGUFWriter::new();
+        w.add_metadata(
+            "general.architecture",
+            GGUFMetaValue::String("tabdpt".into()),
+        );
+        let mut seed = 1900u64;
+        let s = 0.2;
+        put2(&mut w, "encoder.weight", 8, 4, &mut seed, s);
+        put1(&mut w, "encoder.bias", 8, &mut seed);
+        put2(&mut w, "thinking_embed", 2, 8, &mut seed, s);
+        put1(&mut w, "blk.0.attn_norm.weight", 8, &mut seed);
+        put1(&mut w, "blk.0.attn_norm.bias", 8, &mut seed);
+        put1(&mut w, "blk.0.ff_norm.weight", 8, &mut seed);
+        put1(&mut w, "blk.0.ff_norm.bias", 8, &mut seed);
+        put2(&mut w, "blk.0.q_proj.weight", 8, 8, &mut seed, s);
+        put2(&mut w, "blk.0.k_proj.weight", 8, 8, &mut seed, s);
+        put2(&mut w, "blk.0.v_proj.weight", 8, 12, &mut seed, s);
+        put2(&mut w, "blk.0.out_proj.weight", 8, 8, &mut seed, s);
+        put2(&mut w, "blk.0.q_gate.weight", 2, 8, &mut seed, s);
+        put1(&mut w, "blk.0.q_norm.weight", 4, &mut seed);
+        put1(&mut w, "blk.0.k_norm.weight", 4, &mut seed);
+        put2(&mut w, "blk.0.ff_up.weight", 16, 8, &mut seed, s);
+        put2(&mut w, "blk.0.ff_down.weight", 8, 8, &mut seed, s);
+        put2(&mut w, "y_enc.0.fc1.weight", 4, 1, &mut seed, s);
+        put1(&mut w, "y_enc.0.fc1.bias", 4, &mut seed);
+        put2(&mut w, "y_enc.0.fc2.weight", 4, 4, &mut seed, s);
+        put1(&mut w, "y_enc.0.fc2.bias", 4, &mut seed);
+        put2(&mut w, "head_fc1.weight", 8, 8, &mut seed, s);
+        put1(&mut w, "head_fc1.bias", 8, &mut seed);
+        put2(&mut w, "head_fc2.weight", 6, 8, &mut seed, s);
+        put1(&mut w, "head_fc2.bias", 6, &mut seed);
+        let f = std::fs::File::create(&path).unwrap();
+        w.write_to(&mut std::io::BufWriter::new(f)).unwrap();
+
+        let cfg = tiny_config();
+        let burn = BurnTabDptModel::load(&path, cfg).unwrap();
+        let x_support = vec![
+            vec![0.1, 1.2],
+            vec![0.9, -0.3],
+            vec![-1.1, 0.4],
+            vec![1.5, 1.1],
+        ];
+        let y_support = vec![0usize, 1, 1, 0];
+        let x_query = vec![vec![0.2, 0.9], vec![-0.8, 0.1]];
+        let t0 = std::time::Instant::now();
+        let a = burn
+            .predict_classification(&x_support, &y_support, &x_query, 2)
+            .unwrap();
+        let burn_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let b = burn
+            .predict_classification(&x_support, &y_support, &x_query, 2)
+            .unwrap();
+        assert_eq!(a.len(), 2);
+        assert!(a
+            .iter()
+            .all(|r| r.len() == 2 && r.iter().all(|v| v.is_finite())));
+        assert_eq!(a, b, "predict must be deterministic");
+        println!("tabdpt synthetic: burn {burn_ms:.1}ms out={a:?}");
+        // Golden recorded from the verified Burn port (ex-candle parity 0.00e0).
+        let golden = [[0.5918571, 0.4081429], [0.5925009, 0.40749905]];
+        for (ra, re) in a.iter().zip(golden.iter()) {
+            for (x, y) in ra.iter().zip(re.iter()) {
+                assert!((x - y).abs() < 1e-4, "golden drift: {x} vs {y}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

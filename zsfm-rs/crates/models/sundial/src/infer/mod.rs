@@ -1,168 +1,125 @@
-pub mod burn;
-pub mod rope;
+//! Sundial Burn-only inference engine (Burn backend, Flex CPU).
+//!
+//! Patch embedding, transformer blocks with Llama-style RoPE, and the
+//! flow-matching ODE sampler (Heun), with weights loaded straight from GGUF
+//! via [`zsfm_burn::GgufWeights`]. Architecture widths mirror the fixed
+//! constants; layer counts come from GGUF metadata.
 
-use anyhow::Result;
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device, Tensor, D};
-use candle_nn::ops;
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufReader;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::path::Path;
 
-use rope::RopeCache;
-use zsfm_nn::linear;
+use anyhow::{Context, Result};
+use burn::tensor::{activation, Device, Tensor, TensorData};
+use zsfm_burn::linear::burn_linear_nd;
+use zsfm_burn::norm::burn_layer_norm_nd;
+use zsfm_burn::{open_gguf_weights, GgufWeights};
 
 const N_HEADS: usize = 12;
 const HEAD_DIM: usize = 64;
-const EMBED_IN: usize = 32; // 2 * input_token_len
+const EMBED_IN: usize = 32;
 const PATCH_SIZE: usize = 16;
 const TIME_DIM: usize = 256;
 const MAX_SEQ: usize = 4096;
 const ROPE_THETA: f64 = 10000.0;
 
-struct EmbedW {
-    hidden_w: Tensor,
-    hidden_b: Tensor,
-    output_w: Tensor,
-    output_b: Tensor,
-    skip_w: Tensor,
-    skip_b: Tensor,
+fn device() -> Device {
+    Device::flex()
 }
 
-struct AttnW {
-    qkv_w: Tensor,
-    qkv_b: Tensor,
-    o_w: Tensor,
+fn load_t(weights: &GgufWeights, name: &str) -> Result<Tensor<2>> {
+    weights.load_2d(name)
 }
 
-struct NormW {
-    w: Tensor,
-    b: Tensor,
+fn load_v(weights: &GgufWeights, name: &str) -> Result<Tensor<1>> {
+    weights.load_1d(name)
 }
 
-struct BlockW {
-    attn: AttnW,
-    attn_norm: NormW,
-    ffn_norm: NormW,
-    gate_w: Tensor,
-    up_w: Tensor,
-    down_w: Tensor,
+fn linear<const D: usize>(x: Tensor<D>, w: Tensor<2>, b: Option<Tensor<1>>) -> Tensor<D> {
+    burn_linear_nd(x, w, b)
 }
 
-struct FlowResW {
-    ln: NormW,
-    mlp1_w: Tensor,
-    mlp1_b: Tensor,
-    mlp2_w: Tensor,
-    mlp2_b: Tensor,
-    adaln_w: Tensor,
-    adaln_b: Tensor,
+fn layer_norm<const D: usize>(x: Tensor<D>, w: Tensor<1>, b: Tensor<1>) -> Tensor<D> {
+    burn_layer_norm_nd(x, w, b, 1e-5)
 }
 
-struct FlowW {
-    t1_w: Tensor,
-    t1_b: Tensor,
-    t2_w: Tensor,
-    t2_b: Tensor,
-    cond_w: Tensor,
-    cond_b: Tensor,
-    in_w: Tensor,
-    in_b: Tensor,
-    res: Vec<FlowResW>,
-    out_w: Tensor,
-    out_b: Tensor,
-    out_adaln_w: Tensor,
-    out_adaln_b: Tensor,
+fn silu<const D: usize>(x: Tensor<D>) -> Tensor<D> {
+    activation::silu(x)
 }
 
-/// Sundial reads its own architecture (layer count, flow depth, output length, sampling steps)
-/// straight out of the GGUF metadata written at conversion time — there is no separate
-/// `InferConfig`/`config.json` needed for inference (unlike every other model in the workspace).
-/// [`SundialModelBuilder`] only exposes the two things a caller can actually tune at load time:
-/// the compute device and an ODE step-count override.
-pub struct SundialModel {
-    device: Device,
-    embed: EmbedW,
-    blocks: Vec<BlockW>,
-    norm: NormW,
-    flow: FlowW,
-    rope: RopeCache,
+fn softmax_last<const D: usize>(x: Tensor<D>) -> Tensor<D> {
+    activation::softmax(x, D - 1)
+}
+
+struct BurnEmbedW {
+    hidden_w: Tensor<2>,
+    hidden_b: Tensor<1>,
+    output_w: Tensor<2>,
+    output_b: Tensor<1>,
+    skip_w: Tensor<2>,
+    skip_b: Tensor<1>,
+}
+
+struct BurnAttnW {
+    qkv_w: Tensor<2>,
+    qkv_b: Tensor<1>,
+    o_w: Tensor<2>,
+}
+
+struct BurnNormW {
+    w: Tensor<1>,
+    b: Tensor<1>,
+}
+
+struct BurnBlockW {
+    attn: BurnAttnW,
+    attn_norm: BurnNormW,
+    ffn_norm: BurnNormW,
+    gate_w: Tensor<2>,
+    up_w: Tensor<2>,
+    down_w: Tensor<2>,
+}
+
+struct BurnFlowResW {
+    ln_w: Tensor<1>,
+    ln_b: Tensor<1>,
+    mlp1_w: Tensor<2>,
+    mlp1_b: Tensor<1>,
+    mlp2_w: Tensor<2>,
+    mlp2_b: Tensor<1>,
+    adaln_w: Tensor<2>,
+    adaln_b: Tensor<1>,
+}
+
+struct BurnFlowW {
+    t1_w: Tensor<2>,
+    t1_b: Tensor<1>,
+    t2_w: Tensor<2>,
+    t2_b: Tensor<1>,
+    cond_w: Tensor<2>,
+    cond_b: Tensor<1>,
+    in_w: Tensor<2>,
+    in_b: Tensor<1>,
+    res: Vec<BurnFlowResW>,
+    out_w: Tensor<2>,
+    out_b: Tensor<1>,
+    out_adaln_w: Tensor<2>,
+    out_adaln_b: Tensor<1>,
+}
+
+pub struct BurnSundialModel {
+    embed: BurnEmbedW,
+    blocks: Vec<BurnBlockW>,
+    norm_w: Tensor<1>,
+    norm_b: Tensor<1>,
+    flow: BurnFlowW,
+    rope_cos: Tensor<2>,
+    rope_sin: Tensor<2>,
     n_steps: usize,
     output_len: usize,
-    // Precomputed: sinusoidal_embed → t1_proj → silu → t2_proj for steps 0..=n_steps
-    t_emb_table: Vec<Tensor>,
-    causal_mask_cache: Mutex<HashMap<usize, Tensor>>,
+    t_emb_table: Vec<Tensor<1>>,
 }
 
-// ---------------------------------------------------------------------------
-// Builder
-// ---------------------------------------------------------------------------
-
-/// Fluent constructor for [`SundialModel`].
-///
-/// ```no_run
-/// use zsfm_sundial::SundialModel;
-///
-/// # fn main() -> anyhow::Result<()> {
-/// let model = SundialModel::builder("sundial.gguf").steps(20).build()?;
-/// # Ok(()) }
-/// ```
-pub struct SundialModelBuilder {
-    gguf_path: PathBuf,
-    device: Device,
-    steps_override: Option<usize>,
-}
-
-impl SundialModelBuilder {
-    fn new(gguf_path: impl Into<PathBuf>) -> Self {
-        Self {
-            gguf_path: gguf_path.into(),
-            device: Device::Cpu,
-            steps_override: None,
-        }
-    }
-
-    /// Override the GGUF-embedded ODE step count (default: use model metadata, typically 50).
-    /// 10-20 steps recommended; latency scales linearly with this value.
-    pub fn steps(mut self, n: usize) -> Self {
-        self.steps_override = Some(n);
-        self
-    }
-
-    pub fn device(mut self, device: Device) -> Self {
-        self.device = device;
-        self
-    }
-
-    pub fn build(self) -> Result<SundialModel> {
-        SundialModel::load(&self.gguf_path, &self.device, self.steps_override)
-    }
-}
-
-fn get_u32(content: &gguf_file::Content, key: &str) -> Option<u32> {
-    match content.metadata.get(key) {
-        Some(gguf_file::Value::U32(v)) => Some(*v),
-        Some(gguf_file::Value::U64(v)) => Some(*v as u32),
-        _ => None,
-    }
-}
-
-fn layer_norm(x: &Tensor, nw: &NormW) -> Result<Tensor> {
-    zsfm_nn::layer_norm(x, &nw.w, &nw.b, 1e-5)
-}
-
-fn layer_norm_no_params(x: &Tensor) -> Result<Tensor> {
-    zsfm_nn::layer_norm_no_affine(x, 1e-5)
-}
-
-fn silu(x: &Tensor) -> Result<Tensor> {
-    ops::silu(x).map_err(anyhow::Error::from)
-}
-
-fn make_causal_mask(seq: usize, device: &Device) -> Result<Tensor> {
-    zsfm_nn::make_causal_mask(seq, 0, device)
+fn get_u32(weights: &GgufWeights, key: &str) -> Option<u32> {
+    weights.meta_u32(key)
 }
 
 fn sinusoidal_embed(t: f32, dim: usize) -> Vec<f32> {
@@ -181,147 +138,123 @@ fn sinusoidal_embed(t: f32, dim: usize) -> Vec<f32> {
     emb
 }
 
-impl SundialModel {
-    /// Start building a [`SundialModel`] — see [`SundialModelBuilder`].
-    pub fn builder(gguf_path: impl Into<PathBuf>) -> SundialModelBuilder {
-        SundialModelBuilder::new(gguf_path)
-    }
+impl BurnSundialModel {
+    pub fn load(path: &Path, steps_override: Option<usize>) -> Result<Self> {
+        let weights =
+            open_gguf_weights(path).with_context(|| format!("open {}", path.display()))?;
 
-    pub fn load(path: &Path, device: &Device, steps_override: Option<usize>) -> Result<Self> {
-        let f = File::open(path).map_err(|e| anyhow::anyhow!("open {}: {}", path.display(), e))?;
-        let mut reader = BufReader::with_capacity(zsfm_gguf::READ_BUF_CAPACITY, f);
-        let content = gguf_file::Content::read(&mut reader)
-            .map_err(|e| anyhow::anyhow!("read gguf: {}", e))?;
-
-        let n_layers = get_u32(&content, "sundial1.block_count").unwrap_or(12) as usize;
+        let n_layers = get_u32(&weights, "sundial1.block_count").unwrap_or(12) as usize;
         let gguf_n_steps =
-            get_u32(&content, "sundial1.flow.num_sampling_steps").unwrap_or(50) as usize;
+            get_u32(&weights, "sundial1.flow.num_sampling_steps").unwrap_or(50) as usize;
         let n_steps = steps_override.unwrap_or(gguf_n_steps);
-        let flow_depth = get_u32(&content, "sundial1.flow.depth").unwrap_or(3) as usize;
-        let output_len = get_u32(&content, "sundial1.output_token_len").unwrap_or(720) as usize;
+        let flow_depth = get_u32(&weights, "sundial1.flow.depth").unwrap_or(3) as usize;
+        let output_len = get_u32(&weights, "sundial1.output_token_len").unwrap_or(720) as usize;
 
-        macro_rules! lt {
-            ($name:expr) => {{
-                let name: &str = $name;
-                let qt = content
-                    .tensor(&mut reader, name, device)
-                    .map_err(|e| anyhow::anyhow!("load {}: {}", name, e))?;
-                qt.dequantize(device)
-                    .map_err(|e| anyhow::anyhow!("dequantize {}: {}", name, e))?
-            }};
-        }
-
-        let embed = EmbedW {
-            hidden_w: lt!("embed.hidden.weight"),
-            hidden_b: lt!("embed.hidden.bias"),
-            output_w: lt!("embed.output.weight"),
-            output_b: lt!("embed.output.bias"),
-            skip_w: lt!("embed.skip.weight"),
-            skip_b: lt!("embed.skip.bias"),
+        let embed = BurnEmbedW {
+            hidden_w: load_t(&weights, "embed.hidden.weight")?,
+            hidden_b: load_v(&weights, "embed.hidden.bias")?,
+            output_w: load_t(&weights, "embed.output.weight")?,
+            output_b: load_v(&weights, "embed.output.bias")?,
+            skip_w: load_t(&weights, "embed.skip.weight")?,
+            skip_b: load_v(&weights, "embed.skip.bias")?,
         };
 
         let mut blocks = Vec::with_capacity(n_layers);
         for n in 0..n_layers {
-            let p = |s: &str| format!("blk.{n}.{s}");
-            let q_w = lt!(&p("attn_q.weight"));
-            let k_w = lt!(&p("attn_k.weight"));
-            let v_w = lt!(&p("attn_v.weight"));
-            let q_b = lt!(&p("attn_q.bias"));
-            let k_b = lt!(&p("attn_k.bias"));
-            let v_b = lt!(&p("attn_v.bias"));
-            let qkv_w = Tensor::cat(&[&q_w, &k_w, &v_w], 0)
-                .map_err(|e| anyhow::anyhow!("qkv_w cat blk.{n}: {e}"))?;
-            let qkv_b = Tensor::cat(&[&q_b, &k_b, &v_b], 0)
-                .map_err(|e| anyhow::anyhow!("qkv_b cat blk.{n}: {e}"))?;
-            blocks.push(BlockW {
-                attn: AttnW {
+            let qw = load_t(&weights, &format!("blk.{n}.attn_q.weight"))?;
+            let kw = load_t(&weights, &format!("blk.{n}.attn_k.weight"))?;
+            let vw = load_t(&weights, &format!("blk.{n}.attn_v.weight"))?;
+            let qb = load_v(&weights, &format!("blk.{n}.attn_q.bias"))?;
+            let kb = load_v(&weights, &format!("blk.{n}.attn_k.bias"))?;
+            let vb = load_v(&weights, &format!("blk.{n}.attn_v.bias"))?;
+            let qkv_w = Tensor::cat(vec![qw, kw, vw], 0);
+            let qkv_b = Tensor::cat(vec![qb, kb, vb], 0);
+            blocks.push(BurnBlockW {
+                attn: BurnAttnW {
                     qkv_w,
                     qkv_b,
-                    o_w: lt!(&p("attn_out.weight")),
+                    o_w: load_t(&weights, &format!("blk.{n}.attn_out.weight"))?,
                 },
-                attn_norm: NormW {
-                    w: lt!(&p("attn_norm.weight")),
-                    b: lt!(&p("attn_norm.bias")),
+                attn_norm: BurnNormW {
+                    w: load_v(&weights, &format!("blk.{n}.attn_norm.weight"))?,
+                    b: load_v(&weights, &format!("blk.{n}.attn_norm.bias"))?,
                 },
-                ffn_norm: NormW {
-                    w: lt!(&p("ffn_norm.weight")),
-                    b: lt!(&p("ffn_norm.bias")),
+                ffn_norm: BurnNormW {
+                    w: load_v(&weights, &format!("blk.{n}.ffn_norm.weight"))?,
+                    b: load_v(&weights, &format!("blk.{n}.ffn_norm.bias"))?,
                 },
-                gate_w: lt!(&p("ffn_gate.weight")),
-                up_w: lt!(&p("ffn_up.weight")),
-                down_w: lt!(&p("ffn_down.weight")),
+                gate_w: load_t(&weights, &format!("blk.{n}.ffn_gate.weight"))?,
+                up_w: load_t(&weights, &format!("blk.{n}.ffn_up.weight"))?,
+                down_w: load_t(&weights, &format!("blk.{n}.ffn_down.weight"))?,
             });
         }
 
-        let norm = NormW {
-            w: lt!("norm.weight"),
-            b: lt!("norm.bias"),
-        };
+        let norm_w = load_v(&weights, "norm.weight")?;
+        let norm_b = load_v(&weights, "norm.bias")?;
 
         let mut res_blocks = Vec::with_capacity(flow_depth);
         for k in 0..flow_depth {
             let fp = |s: &str| format!("flow.res.{k}.{s}");
-            res_blocks.push(FlowResW {
-                ln: NormW {
-                    w: lt!(&fp("ln.weight")),
-                    b: lt!(&fp("ln.bias")),
-                },
-                mlp1_w: lt!(&fp("mlp1.weight")),
-                mlp1_b: lt!(&fp("mlp1.bias")),
-                mlp2_w: lt!(&fp("mlp2.weight")),
-                mlp2_b: lt!(&fp("mlp2.bias")),
-                adaln_w: lt!(&fp("adaln.weight")),
-                adaln_b: lt!(&fp("adaln.bias")),
+            res_blocks.push(BurnFlowResW {
+                ln_w: load_v(&weights, &fp("ln.weight"))?,
+                ln_b: load_v(&weights, &fp("ln.bias"))?,
+                mlp1_w: load_t(&weights, &fp("mlp1.weight"))?,
+                mlp1_b: load_v(&weights, &fp("mlp1.bias"))?,
+                mlp2_w: load_t(&weights, &fp("mlp2.weight"))?,
+                mlp2_b: load_v(&weights, &fp("mlp2.bias"))?,
+                adaln_w: load_t(&weights, &fp("adaln.weight"))?,
+                adaln_b: load_v(&weights, &fp("adaln.bias"))?,
             });
         }
-
-        let flow = FlowW {
-            t1_w: lt!("flow.t_proj1.weight"),
-            t1_b: lt!("flow.t_proj1.bias"),
-            t2_w: lt!("flow.t_proj2.weight"),
-            t2_b: lt!("flow.t_proj2.bias"),
-            cond_w: lt!("flow.cond.weight"),
-            cond_b: lt!("flow.cond.bias"),
-            in_w: lt!("flow.in_proj.weight"),
-            in_b: lt!("flow.in_proj.bias"),
+        let flow = BurnFlowW {
+            t1_w: load_t(&weights, "flow.t_proj1.weight")?,
+            t1_b: load_v(&weights, "flow.t_proj1.bias")?,
+            t2_w: load_t(&weights, "flow.t_proj2.weight")?,
+            t2_b: load_v(&weights, "flow.t_proj2.bias")?,
+            cond_w: load_t(&weights, "flow.cond.weight")?,
+            cond_b: load_v(&weights, "flow.cond.bias")?,
+            in_w: load_t(&weights, "flow.in_proj.weight")?,
+            in_b: load_v(&weights, "flow.in_proj.bias")?,
             res: res_blocks,
-            out_w: lt!("flow.out_linear.weight"),
-            out_b: lt!("flow.out_linear.bias"),
-            out_adaln_w: lt!("flow.out_adaln.weight"),
-            out_adaln_b: lt!("flow.out_adaln.bias"),
+            out_w: load_t(&weights, "flow.out_linear.weight")?,
+            out_b: load_v(&weights, "flow.out_linear.bias")?,
+            out_adaln_w: load_t(&weights, "flow.out_adaln.weight")?,
+            out_adaln_b: load_v(&weights, "flow.out_adaln.bias")?,
         };
 
-        let rope = RopeCache::new(HEAD_DIM, MAX_SEQ, ROPE_THETA, device)?;
+        let (rope_cos, rope_sin) = build_rope_tables(HEAD_DIM, MAX_SEQ, ROPE_THETA);
 
-        // Precompute time embeddings for all ODE steps (sinusoidal → t1_proj → silu → t2_proj)
-        let t_emb_table: Vec<Tensor> = (0..=n_steps)
+        // Precompute time embeddings for all ODE steps.
+        let t_emb_table: Vec<Tensor<1>> = (0..=n_steps)
             .map(|i| {
                 let t_scaled = i as f32 / n_steps as f32 * 1000.0;
-                let t_raw =
-                    Tensor::from_vec(sinusoidal_embed(t_scaled, TIME_DIM), (1, TIME_DIM), device)?;
-                let t_h = silu(&linear(&t_raw, &flow.t1_w, Some(&flow.t1_b))?)?;
-                linear(&t_h, &flow.t2_w, Some(&flow.t2_b))
+                let t_raw = Tensor::<2>::from_data(
+                    TensorData::new(sinusoidal_embed(t_scaled, TIME_DIM), [1, TIME_DIM]),
+                    &device(),
+                );
+                let t_h = silu(linear(t_raw, flow.t1_w.clone(), Some(flow.t1_b.clone())));
+                linear(t_h, flow.t2_w.clone(), Some(flow.t2_b.clone()))
+                    .reshape([flow.t2_b.dims()[0]])
             })
-            .collect::<Result<Vec<_>>>()
-            .map_err(|e| anyhow::anyhow!("t_emb_table: {e}"))?;
+            .collect();
 
         Ok(Self {
-            device: device.clone(),
             embed,
             blocks,
-            norm,
+            norm_w,
+            norm_b,
             flow,
-            rope,
+            rope_cos,
+            rope_sin,
             n_steps,
             output_len,
             t_emb_table,
-            causal_mask_cache: Mutex::new(HashMap::new()),
         })
     }
 
-    pub fn forecast(&self, context: &[f32], device: &Device) -> Result<Vec<f32>> {
+    pub fn forecast(&self, context: &[f32]) -> Result<Vec<f32>> {
+        let dev = device();
         let n = context.len();
-        // ReVIN: whole-series population mean/std
         let mean = context.iter().sum::<f32>() / n as f32;
         let var = context
             .iter()
@@ -331,7 +264,6 @@ impl SundialModel {
         let std = (var + 1e-5).sqrt();
         let normed: Vec<f32> = context.iter().map(|&x| (x - mean) / std).collect();
 
-        // Pad to multiple of patch_size and build embedding input [values | mask]
         let n_patches = (n + PATCH_SIZE - 1) / PATCH_SIZE;
         let mut embed_in = vec![0.0f32; n_patches * EMBED_IN];
         for p in 0..n_patches {
@@ -342,183 +274,308 @@ impl SundialModel {
                 embed_in[p * EMBED_IN + PATCH_SIZE + (i - start)] = 1.0;
             }
         }
-
-        let x = Tensor::from_vec(embed_in, (1, n_patches, EMBED_IN), device)?;
-        let mut h = self.embed_forward(&x)?;
-
-        let mask = {
-            let mut cache = self
-                .causal_mask_cache
-                .lock()
-                .map_err(|_| anyhow::anyhow!("cache mutex poisoned"))?;
-            if !cache.contains_key(&n_patches) {
-                cache.insert(n_patches, make_causal_mask(n_patches, &self.device)?);
-            }
-            cache[&n_patches].clone()
-        };
+        let x = Tensor::<3>::from_data(TensorData::new(embed_in, [1, n_patches, EMBED_IN]), &dev);
+        let mut h = self.embed_forward(x);
+        let mask = burn_causal_mask(n_patches);
         for block in &self.blocks {
-            h = self.block_forward(&h, block, &mask)?;
+            h = self.block_forward(h, block, mask.clone());
         }
-        h = layer_norm(&h, &self.norm)?;
-
-        // Last patch hidden state as flow condition
-        let cond = h.narrow(1, n_patches - 1, 1)?.squeeze(1)?; // [1, hidden]
-
-        // Flow matching: Euler from t=0 (noise) to t=1 (data)
-        let output = self.flow_sample(&cond, device)?;
-
-        let vals = output.to_vec2::<f32>()?;
-        Ok(vals[0].iter().map(|&v| v * std + mean).collect())
+        h = layer_norm(h, self.norm_w.clone(), self.norm_b.clone());
+        let cond: Tensor<2> = h.narrow(1, n_patches - 1, 1).squeeze_dim(0);
+        let output = self.flow_sample(cond);
+        let vals: Vec<f32> = output
+            .to_data()
+            .try_to_vec()
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        Ok(vals.iter().map(|&v| v * std + mean).collect())
     }
 
-    fn embed_forward(&self, x: &Tensor) -> Result<Tensor> {
-        let h = silu(&linear(
+    fn embed_forward(&self, x: Tensor<3>) -> Tensor<3> {
+        let h = silu(linear(
+            x.clone(),
+            self.embed.hidden_w.clone(),
+            Some(self.embed.hidden_b.clone()),
+        ));
+        let out = linear(
+            h,
+            self.embed.output_w.clone(),
+            Some(self.embed.output_b.clone()),
+        );
+        let skip = linear(
             x,
-            &self.embed.hidden_w,
-            Some(&self.embed.hidden_b),
-        )?)?;
-        let out = linear(&h, &self.embed.output_w, Some(&self.embed.output_b))?;
-        let skip = linear(x, &self.embed.skip_w, Some(&self.embed.skip_b))?;
-        Ok((out + skip)?)
+            self.embed.skip_w.clone(),
+            Some(self.embed.skip_b.clone()),
+        );
+        out + skip
     }
 
-    fn block_forward(&self, x: &Tensor, blk: &BlockW, mask: &Tensor) -> Result<Tensor> {
-        let h = layer_norm(x, &blk.attn_norm)?;
-        let h = self.attn_forward(&h, &blk.attn, mask)?;
-        let x = (x + &h)?;
-        let h = layer_norm(&x, &blk.ffn_norm)?;
-        let h = self.ffn_forward(&h, blk)?;
-        Ok((x + h)?)
+    fn block_forward(&self, x: Tensor<3>, blk: &BurnBlockW, mask: Tensor<4>) -> Tensor<3> {
+        let h = layer_norm(x.clone(), blk.attn_norm.w.clone(), blk.attn_norm.b.clone());
+        let h = self.attn_forward(h, &blk.attn, mask);
+        let x = x + h;
+        let h = layer_norm(x.clone(), blk.ffn_norm.w.clone(), blk.ffn_norm.b.clone());
+        let h = self.ffn_forward(h, blk);
+        x + h
     }
 
-    fn attn_forward(&self, x: &Tensor, attn: &AttnW, mask: &Tensor) -> Result<Tensor> {
-        let (b, seq, _) = x.dims3()?;
+    fn attn_forward(&self, x: Tensor<3>, attn: &BurnAttnW, mask: Tensor<4>) -> Tensor<3> {
+        let [b, seq, _] = x.dims();
         let d = N_HEADS * HEAD_DIM;
-        let qkv = linear(x, &attn.qkv_w, Some(&attn.qkv_b))?;
-        let q = qkv.narrow(D::Minus1, 0, d)?.contiguous()?;
-        let k = qkv.narrow(D::Minus1, d, d)?.contiguous()?;
-        let v = qkv.narrow(D::Minus1, 2 * d, d)?.contiguous()?;
-
-        // [b, seq, H*D] → [b, H, seq, D]
-        let q = q
-            .reshape((b, seq, N_HEADS, HEAD_DIM))?
-            .permute((0, 2, 1, 3))?
-            .contiguous()?;
-        let k = k
-            .reshape((b, seq, N_HEADS, HEAD_DIM))?
-            .permute((0, 2, 1, 3))?
-            .contiguous()?;
-        let v = v
-            .reshape((b, seq, N_HEADS, HEAD_DIM))?
-            .permute((0, 2, 1, 3))?
-            .contiguous()?;
-
-        let q = self.rope.apply(&q, 0)?;
-        let k = self.rope.apply(&k, 0)?;
-
-        let scale = 1.0 / (HEAD_DIM as f64).sqrt();
-        let scores = q
-            .matmul(&k.transpose(D::Minus2, D::Minus1)?)?
-            .affine(scale, 0.0)?;
-        let scores = scores.broadcast_add(mask)?;
-        let aw = ops::softmax(&scores, D::Minus1)?;
-
-        let out = aw.matmul(&v)?;
-        let out = out
-            .permute((0, 2, 1, 3))?
-            .reshape((b, seq, N_HEADS * HEAD_DIM))?;
-        linear(&out, &attn.o_w, None)
+        let qkv = linear(x, attn.qkv_w.clone(), Some(attn.qkv_b.clone()));
+        let q: Tensor<3> = qkv.clone().narrow(2, 0, d);
+        let k: Tensor<3> = qkv.clone().narrow(2, d, d);
+        let v: Tensor<3> = qkv.narrow(2, 2 * d, d);
+        let pack = |t: Tensor<3>| t.reshape([b, seq, N_HEADS, HEAD_DIM]).permute([0, 2, 1, 3]);
+        let (q, k, v) = (pack(q), pack(k), pack(v));
+        let q = self.rope_apply(q, 0);
+        let k = self.rope_apply(k, 0);
+        let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+        let scores = q.matmul(k.transpose()).mul_scalar(scale);
+        let scores = scores + mask;
+        let aw = softmax_last(scores);
+        let out = aw.matmul(v);
+        let out: Tensor<3> = out.permute([0, 2, 1, 3]).reshape([b, seq, d]);
+        linear(out, attn.o_w.clone(), None)
     }
 
-    fn ffn_forward(&self, x: &Tensor, blk: &BlockW) -> Result<Tensor> {
-        let gate = silu(&linear(x, &blk.gate_w, None)?)?;
-        let up = linear(x, &blk.up_w, None)?;
-        let h = (gate * &up)?;
-        linear(&h, &blk.down_w, None)
+    fn rope_apply(&self, x: Tensor<4>, start_pos: usize) -> Tensor<4> {
+        let dims = x.dims();
+        let seq = dims[2];
+        let hd = dims[3];
+        let half = hd / 2;
+        let cos = self
+            .rope_cos
+            .clone()
+            .narrow(0, start_pos, seq)
+            .unsqueeze_dim::<3>(0)
+            .unsqueeze_dim::<4>(0);
+        let sin = self
+            .rope_sin
+            .clone()
+            .narrow(0, start_pos, seq)
+            .unsqueeze_dim::<3>(0)
+            .unsqueeze_dim::<4>(0);
+        let x1 = x.clone().narrow(3, 0, half);
+        let x2 = x.clone().narrow(3, half, half);
+        let rotated = Tensor::cat(vec![x2.mul_scalar(-1.0), x1], 3);
+        x * cos + rotated * sin
     }
 
-    // Evaluate the flow network at a given state x and timestep-conditioned activations c_act.
-    fn flow_net_eval(&self, x: &Tensor, c_act: &Tensor) -> Result<Tensor> {
-        let mut h = linear(x, &self.flow.in_w, Some(&self.flow.in_b))?;
+    fn ffn_forward(&self, x: Tensor<3>, blk: &BurnBlockW) -> Tensor<3> {
+        let gate = silu(linear(x.clone(), blk.gate_w.clone(), None));
+        let up = linear(x, blk.up_w.clone(), None);
+        linear(gate * up, blk.down_w.clone(), None)
+    }
+
+    fn flow_net_eval(&self, x: Tensor<2>, c_act: Tensor<2>) -> Tensor<2> {
+        let mut h = linear(x, self.flow.in_w.clone(), Some(self.flow.in_b.clone()));
         for res in &self.flow.res {
-            let adaln = linear(c_act, &res.adaln_w, Some(&res.adaln_b))?;
-            let third = adaln.dim(D::Minus1)? / 3;
-            let shift = adaln.narrow(D::Minus1, 0, third)?;
-            let scale = adaln.narrow(D::Minus1, third, third)?;
-            let gate = adaln.narrow(D::Minus1, 2 * third, third)?;
-            let h_norm = layer_norm(&h, &res.ln)?;
-            let h_mod = h_norm
-                .broadcast_mul(&scale.affine(1.0, 1.0)?)?
-                .broadcast_add(&shift)?;
-            let h_mlp = silu(&linear(&h_mod, &res.mlp1_w, Some(&res.mlp1_b))?)?;
-            let h_mlp = linear(&h_mlp, &res.mlp2_w, Some(&res.mlp2_b))?;
-            h = (h + (gate * h_mlp)?)?;
+            let adaln = linear(
+                c_act.clone(),
+                res.adaln_w.clone(),
+                Some(res.adaln_b.clone()),
+            );
+            let third = adaln.dims()[1] / 3;
+            let shift = adaln.clone().narrow(1, 0, third);
+            let scale = adaln.clone().narrow(1, third, third);
+            let gate = adaln.narrow(1, 2 * third, third);
+            let h_norm = layer_norm(h.clone(), res.ln_w.clone(), res.ln_b.clone());
+            let h_mod = h_norm * scale.add_scalar(1.0) + shift;
+            let h_mlp = silu(linear(h_mod, res.mlp1_w.clone(), Some(res.mlp1_b.clone())));
+            let h_mlp = linear(h_mlp, res.mlp2_w.clone(), Some(res.mlp2_b.clone()));
+            h = h + gate * h_mlp;
         }
-        let adaln = linear(c_act, &self.flow.out_adaln_w, Some(&self.flow.out_adaln_b))?;
-        let half = adaln.dim(D::Minus1)? / 2;
-        let shift = adaln.narrow(D::Minus1, 0, half)?;
-        let scale = adaln.narrow(D::Minus1, half, half)?;
-        let h_norm = layer_norm_no_params(&h)?;
-        let h_mod = h_norm
-            .broadcast_mul(&scale.affine(1.0, 1.0)?)?
-            .broadcast_add(&shift)?;
-        linear(&h_mod, &self.flow.out_w, Some(&self.flow.out_b))
+        let adaln = linear(
+            c_act,
+            self.flow.out_adaln_w.clone(),
+            Some(self.flow.out_adaln_b.clone()),
+        );
+        let half = adaln.dims()[1] / 2;
+        let shift = adaln.clone().narrow(1, 0, half);
+        let scale = adaln.narrow(1, half, half);
+        let h_norm = burn_layer_norm_nd_no_affine(h);
+        let h_mod = h_norm * scale.add_scalar(1.0) + shift;
+        linear(
+            h_mod,
+            self.flow.out_w.clone(),
+            Some(self.flow.out_b.clone()),
+        )
     }
 
-    // Heun's method (2nd-order Runge-Kutta) for the flow ODE.
-    // Each step does 2 network evals but converges quadratically, so n_steps/2 fewer steps
-    // are needed compared to Euler for equivalent accuracy. For OT-FM (linear paths) the
-    // default 50-step Euler run can be replaced by ~10 Heun steps with near-identical output.
-    fn flow_sample(&self, cond: &Tensor, device: &Device) -> Result<Tensor> {
-        let cond_emb = linear(cond, &self.flow.cond_w, Some(&self.flow.cond_b))?;
-        let dt = 1.0f64 / self.n_steps as f64;
-        let mut x = Tensor::zeros((1, self.output_len), DType::F32, device)?;
-
-        // c[i] = silu(t_emb_table[i] + cond_emb); c2 at step i == c1 at step i+1,
-        // so compute once and carry forward to halve the add+silu cost.
-        let mut c_cur = silu(&(&self.t_emb_table[0] + &cond_emb)?)?;
+    fn flow_sample(&self, cond: Tensor<2>) -> Tensor<2> {
+        let dev = device();
+        let cond_emb = linear(
+            cond,
+            self.flow.cond_w.clone(),
+            Some(self.flow.cond_b.clone()),
+        );
+        let dt = 1.0f32 / self.n_steps as f32;
+        let mut x = Tensor::<2>::zeros([1, self.output_len], &dev);
+        let mut c_cur = silu(self.t_emb_table[0].clone().unsqueeze_dim::<2>(0) + cond_emb.clone());
         for i in 0..self.n_steps {
-            let k1 = self.flow_net_eval(&x, &c_cur)?;
-
-            let x_pred = (x.clone() + k1.affine(dt, 0.0)?)?;
-
-            let c_next = silu(&(&self.t_emb_table[i + 1] + &cond_emb)?)?;
-            let k2 = self.flow_net_eval(&x_pred, &c_next)?;
-
-            x = (x + ((&k1 + &k2)? * (dt * 0.5))?)?;
+            let k1 = self.flow_net_eval(x.clone(), c_cur.clone());
+            let x_pred = x.clone() + k1.clone().mul_scalar(dt);
+            let c_next =
+                silu(self.t_emb_table[i + 1].clone().unsqueeze_dim::<2>(0) + cond_emb.clone());
+            let k2 = self.flow_net_eval(x_pred, c_next.clone());
+            x = x + (k1 + k2).mul_scalar(dt * 0.5);
             c_cur = c_next;
         }
-        Ok(x)
+        x
     }
 }
 
-// ---------------------------------------------------------------------------
-// zsfm-core::Forecaster
-// ---------------------------------------------------------------------------
+fn burn_layer_norm_nd_no_affine(x: Tensor<2>) -> Tensor<2> {
+    zsfm_burn::norm::burn_layer_norm_no_affine(x, 1e-5)
+}
 
-impl zsfm_core::Forecaster for SundialModel {
-    /// No config.json is consulted for inference — see the struct docs.
-    type Config = ();
+fn build_rope_tables(head_dim: usize, max_seq: usize, theta: f64) -> (Tensor<2>, Tensor<2>) {
+    let dev = device();
+    let half = head_dim / 2;
+    let inv_freq: Vec<f64> = (0..half)
+        .map(|i| 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64))
+        .collect();
+    let mut cos = vec![0.0f32; max_seq * head_dim];
+    let mut sin = vec![0.0f32; max_seq * head_dim];
+    for p in 0..max_seq {
+        for i in 0..half {
+            let angle = (p as f64 * inv_freq[i]) as f32;
+            let (s, c) = angle.sin_cos();
+            cos[p * head_dim + i] = c;
+            cos[p * head_dim + half + i] = c;
+            sin[p * head_dim + i] = s;
+            sin[p * head_dim + half + i] = s;
+        }
+    }
+    (
+        Tensor::<2>::from_data(TensorData::new(cos, [max_seq, head_dim]), &dev),
+        Tensor::<2>::from_data(TensorData::new(sin, [max_seq, head_dim]), &dev),
+    )
+}
 
-    fn load(gguf_path: &Path, _config: ()) -> Result<Self> {
-        SundialModel::load(gguf_path, &Device::Cpu, None)
+fn burn_causal_mask(n: usize) -> Tensor<4> {
+    let dev = device();
+    let data: Vec<f32> = (0..n)
+        .flat_map(|q| (0..n).map(move |k| if k <= q { 0.0f32 } else { f32::NEG_INFINITY }))
+        .collect();
+    Tensor::<2>::from_data(TensorData::new(data, [n, n]), &dev)
+        .unsqueeze_dim::<3>(0)
+        .unsqueeze_dim::<4>(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zsfm_gguf::{GGMLType, GGUFMetaValue, GGUFWriter};
+
+    fn pseudo(n: usize, seed: u64) -> Vec<f32> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+            })
+            .collect()
     }
 
-    /// Sundial is univariate-only and point-forecast-only (flow-matching samples a single path,
-    /// not a quantile distribution) — `mask` is unused and the returned matrix has exactly one
-    /// row (the point forecast) and one variate.
-    fn forecast(
-        &self,
-        context: &[Vec<f32>],
-        _mask: &[Vec<bool>],
-        horizon: usize,
-    ) -> Result<zsfm_core::QuantileMatrix> {
-        anyhow::ensure!(
-            context.len() == 1,
-            "SundialModel only supports univariate forecasting (1 variate)"
+    fn put2(w: &mut GGUFWriter, name: &str, rows: usize, cols: usize, seed: &mut u64, scale: f32) {
+        *seed += 1;
+        let data: Vec<f32> = pseudo(rows * cols, *seed)
+            .iter()
+            .map(|v| v * scale)
+            .collect();
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        w.add_tensor(name, vec![cols as u64, rows as u64], GGMLType::F32, bytes);
+    }
+
+    fn put1(w: &mut GGUFWriter, name: &str, n: usize, seed: &mut u64) {
+        *seed += 1;
+        let bytes: Vec<u8> = pseudo(n, *seed)
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        w.add_tensor(name, vec![n as u64], GGMLType::F32, bytes);
+    }
+
+    #[test]
+    fn burn_forecast_golden() {
+        // Real widths (768/12x64), 1 layer, depth 1, 2 ODE steps, output 4.
+        let dir = std::env::temp_dir().join(format!("sundial-burn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf");
+        let mut w = GGUFWriter::new();
+        w.add_metadata(
+            "general.architecture",
+            GGUFMetaValue::String("sundial".into()),
         );
-        let raw = SundialModel::forecast(self, &context[0], &self.device)?;
-        let point: Vec<f32> = raw.into_iter().take(horizon).collect();
-        Ok(vec![vec![point]])
+        w.add_metadata("sundial1.block_count", GGUFMetaValue::Uint32(1));
+        w.add_metadata("sundial1.flow.num_sampling_steps", GGUFMetaValue::Uint32(2));
+        w.add_metadata("sundial1.flow.depth", GGUFMetaValue::Uint32(1));
+        w.add_metadata("sundial1.output_token_len", GGUFMetaValue::Uint32(4));
+        let mut seed = 700u64;
+        let s = 0.05;
+        put2(&mut w, "embed.hidden.weight", 32, 32, &mut seed, s);
+        put1(&mut w, "embed.hidden.bias", 32, &mut seed);
+        put2(&mut w, "embed.output.weight", 768, 32, &mut seed, s);
+        put1(&mut w, "embed.output.bias", 768, &mut seed);
+        put2(&mut w, "embed.skip.weight", 768, 32, &mut seed, s);
+        put1(&mut w, "embed.skip.bias", 768, &mut seed);
+        for t in ["attn_q", "attn_k", "attn_v"] {
+            put2(&mut w, &format!("blk.0.{t}.weight"), 768, 768, &mut seed, s);
+            put1(&mut w, &format!("blk.0.{t}.bias"), 768, &mut seed);
+        }
+        put2(&mut w, "blk.0.attn_out.weight", 768, 768, &mut seed, s);
+        put1(&mut w, "blk.0.attn_norm.weight", 768, &mut seed);
+        put1(&mut w, "blk.0.attn_norm.bias", 768, &mut seed);
+        put1(&mut w, "blk.0.ffn_norm.weight", 768, &mut seed);
+        put1(&mut w, "blk.0.ffn_norm.bias", 768, &mut seed);
+        put2(&mut w, "blk.0.ffn_gate.weight", 768, 768, &mut seed, s);
+        put2(&mut w, "blk.0.ffn_up.weight", 768, 768, &mut seed, s);
+        put2(&mut w, "blk.0.ffn_down.weight", 768, 768, &mut seed, s);
+        put1(&mut w, "norm.weight", 768, &mut seed);
+        put1(&mut w, "norm.bias", 768, &mut seed);
+        put2(&mut w, "flow.t_proj1.weight", 8, 256, &mut seed, s);
+        put1(&mut w, "flow.t_proj1.bias", 8, &mut seed);
+        put2(&mut w, "flow.t_proj2.weight", 8, 8, &mut seed, s);
+        put1(&mut w, "flow.t_proj2.bias", 8, &mut seed);
+        put2(&mut w, "flow.cond.weight", 8, 768, &mut seed, s);
+        put1(&mut w, "flow.cond.bias", 8, &mut seed);
+        put2(&mut w, "flow.in_proj.weight", 8, 4, &mut seed, s);
+        put1(&mut w, "flow.in_proj.bias", 8, &mut seed);
+        put1(&mut w, "flow.res.0.ln.weight", 8, &mut seed);
+        put1(&mut w, "flow.res.0.ln.bias", 8, &mut seed);
+        put2(&mut w, "flow.res.0.mlp1.weight", 8, 8, &mut seed, s);
+        put1(&mut w, "flow.res.0.mlp1.bias", 8, &mut seed);
+        put2(&mut w, "flow.res.0.mlp2.weight", 8, 8, &mut seed, s);
+        put1(&mut w, "flow.res.0.mlp2.bias", 8, &mut seed);
+        put2(&mut w, "flow.res.0.adaln.weight", 24, 8, &mut seed, s);
+        put1(&mut w, "flow.res.0.adaln.bias", 24, &mut seed);
+        put2(&mut w, "flow.out_linear.weight", 4, 8, &mut seed, s);
+        put1(&mut w, "flow.out_linear.bias", 4, &mut seed);
+        put2(&mut w, "flow.out_adaln.weight", 16, 8, &mut seed, s);
+        put1(&mut w, "flow.out_adaln.bias", 16, &mut seed);
+        let f = std::fs::File::create(&path).unwrap();
+        w.write_to(&mut std::io::BufWriter::new(f)).unwrap();
+
+        let burn = BurnSundialModel::load(&path, None).unwrap();
+        let ctx: Vec<f32> = (0..16).map(|i| 10.0 + 0.5 * i as f32).collect();
+        let t0 = std::time::Instant::now();
+        let a = burn.forecast(&ctx).unwrap();
+        let burn_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let b = burn.forecast(&ctx).unwrap();
+        assert_eq!(a.len(), 4);
+        assert!(a.iter().all(|v| v.is_finite()));
+        assert_eq!(a, b, "forecast must be deterministic");
+        println!("sundial synthetic: burn {burn_ms:.1}ms out={a:?}");
+        // Golden recorded from the verified Burn implementation.
+        let golden: [f32; 4] = [12.953651, 14.637471, 13.848478, 14.506356];
+        assert_eq!(a.len(), golden.len());
+        for (x, y) in a.iter().zip(golden.iter()) {
+            assert!((x - y).abs() < 1e-4, "golden drift: {x} vs {y}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

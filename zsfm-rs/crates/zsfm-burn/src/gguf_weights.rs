@@ -2,8 +2,6 @@
 //!
 //! Reads F32/F16/BF16/Q8_0 tensors with the in-workspace `zsfm_gguf`
 //! reader, decodes everything to F32 host bytes, and builds Burn tensors.
-//! Replaces the migration-era bridge that went through candle's GGUF
-//! reader (`burn_weight_2d` and friends now delegate to this).
 
 use std::collections::HashMap;
 use std::io::BufReader;
