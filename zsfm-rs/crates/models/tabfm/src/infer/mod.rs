@@ -811,7 +811,8 @@ fn mha_core(
     };
     let q = rms(q, w.q_norm.clone(), eps);
     let k = rms(k, w.k_norm.clone(), eps);
-    let scale = softplus(w.per_dim_scale.clone()).mul_scalar(std::f32::consts::LOG2_E / (hd as f32).sqrt());
+    let scale =
+        softplus(w.per_dim_scale.clone()).mul_scalar(std::f32::consts::LOG2_E / (hd as f32).sqrt());
     let qd = q.dims();
     let q = (q.reshape([qd[0] * qd[1] * qd[2], hd]) * scale.unsqueeze_dim::<2>(0)).reshape(qd);
     let q: Tensor<4> = q.permute([0, 2, 1, 3]);

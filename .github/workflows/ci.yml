@@ -35,7 +35,7 @@ jobs:
         # Shared crates stay warning-free; model kernels keep historic
         # style (too many args, manual math) so bit-exact ports stay untouched.
         run: |
-          cargo clippy -p zsfm-core -p zsfm-gguf -p zsfm-hub -p zsfm-nn -p zsfm-checkpoint -p zsfm-burn --all-targets -- -D warnings -A clippy::chunks-exact-to-as-chunks -A clippy::manual-is-multiple-of
+          cargo clippy -p zsfm-core -p zsfm-gguf -p zsfm-hub -p zsfm-checkpoint -p zsfm-burn --all-targets -- -D warnings -A clippy::chunks-exact-to-as-chunks -A clippy::manual-is-multiple-of
           cargo check -p zsfm --all-targets
 
   build-and-test:
@@ -109,7 +109,7 @@ jobs:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         # Full workspace needs hdf5-metno C build which often fails on MSVC;
         # at minimum ensure the core crates check cleanly on Windows.
-        run: cargo check -p zsfm-core -p zsfm-gguf -p zsfm-nn -p zsfm-hub
+        run: cargo check -p zsfm-core -p zsfm-gguf -p zsfm-hub
 
   audit:
     name: cargo audit + deny

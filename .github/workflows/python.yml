@@ -71,7 +71,7 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             manylinux: auto
-          # windows is intentionally not enabled yet — candle's blake3 etc. need
+          # windows is intentionally not enabled yet — native deps need
           # extra setup on windows-latest. Re-add when CI has capacity:
           # - os: windows-latest
           #   target: x64
