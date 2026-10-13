@@ -140,13 +140,20 @@ impl GgufWeights {
         ))
     }
 
-    /// Load a 1D `[n]` F32 tensor.
+    /// Load a 1D `[n]` F32 tensor. Like the retired candle bridge
+    /// (`burn_weight_1d`), this flattens any stored shape: real checkpoints
+    /// sometimes store row vectors as `[1, n]`.
     pub fn load_1d(&self, name: &str) -> Result<Tensor<1>> {
         let (shape, _) = self.get(name)?;
-        anyhow::ensure!(shape.len() == 1, "tensor {name}: want 1D, got {shape:?}");
         let data = self.f32_vec(name)?;
+        let n: usize = shape.iter().product::<u64>() as usize;
+        anyhow::ensure!(
+            data.len() == n,
+            "tensor {name}: decoded {} values, want {n}",
+            data.len()
+        );
         Ok(Tensor::<1>::from_data(
-            TensorData::new(data, [shape[0] as usize]),
+            TensorData::new(data, [n]),
             &device(),
         ))
     }

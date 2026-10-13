@@ -68,11 +68,18 @@ the `ZSFM_ENGINE`/`zsfm_burn::Engine` seam are deleted. Burn runs Flex CPU.
 - Python bindings (`zsfm-python`) now wrap the Burn models (uncompilable in
   CI here — pyo3 needs system Python headers; needs a maturin build check).
 
-## Smoke test (real weights, Burn-only CLI)
+## Smoke test (real weights, Burn-only CLI + Python)
 
 - `zsfm ttm convert` pulled `ibm-granite/granite-timeseries-ttm-r2`
   (134 tensors → 3.2 MB F32 GGUF) with no Python.
 - `zsfm ttm infer` on a 512-step sine+trend context (end ≈33.58),
   horizon 12: point forecast starts at 33.61 and stays smooth/finite —
   sane continuation, envelope + usage fields correct.
+- Python `zsfm.TtmModel(...).forecast(...)` on the same GGUF returns
+  bit-identical values to the CLI; `pytest tests/python` (6 tests) green.
+- `zsfm mitra convert` pulled `autogluon/mitra-classifier` (392 tensors →
+  303 MB F32 GGUF). Python `MitraModel.predict_classification` and the CLI
+  agree to print precision. This caught a real-checkpoint shape quirk:
+  `y_mask.weight` is stored `[1, 512]`, so `GgufWeights::load_1d` flattens
+  any stored shape — exactly the retired candle bridge's semantics.
 - GPU backends (Wgpu/Metal/Cuda) + Fusion + true Q8 inference.
