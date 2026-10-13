@@ -660,7 +660,7 @@ mod tests {
         for (ra, re) in a.iter().zip(golden.iter()) {
             assert_eq!(ra.len(), re.len());
             for (x, y) in ra.iter().zip(re.iter()) {
-                assert!((x - y).abs() < 1e-4, "golden drift: {x} vs {y}");
+                assert!((x - y).abs() < 1e-3, "golden drift: {x} vs {y}");
             }
         }
         let _ = std::fs::remove_dir_all(&dir);

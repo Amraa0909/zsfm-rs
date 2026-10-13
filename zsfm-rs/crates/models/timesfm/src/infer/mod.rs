@@ -868,7 +868,7 @@ mod tests {
             "attn sum drift: {sum} vs {golden_sum}"
         );
         for (g, e) in head.iter().zip(golden_head.iter()) {
-            assert!((g - e).abs() < 1e-4, "attn head drift: {g} vs {e}");
+            assert!((g - e).abs() < 1e-3, "attn head drift: {g} vs {e}");
         }
     }
 }

@@ -47,7 +47,7 @@ fn rms<const D: usize>(x: Tensor<D>, w: Tensor<1>, eps: f64) -> Tensor<D> {
 }
 
 fn sigmoid<const D: usize>(x: Tensor<D>) -> Tensor<D> {
-    ((x.neg().exp() + 1.0).recip())
+    (x.neg().exp() + 1.0).recip()
 }
 
 fn silu<const D: usize>(x: Tensor<D>) -> Tensor<D> {

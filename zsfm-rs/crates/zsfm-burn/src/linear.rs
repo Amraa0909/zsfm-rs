@@ -4,7 +4,7 @@ use burn::tensor::Tensor;
 use burn::tensor::{Device, TensorData};
 
 /// y = x @ w^T + b.
-/// `x`: [lead, d_in], `w`: [d_out, d_in], `b`: [d_out].
+/// `x`: `[lead, d_in]`, `w`: `[d_out, d_in]`, `b`: `[d_out]`.
 pub fn burn_linear_bias(x: Tensor<2>, w: Tensor<2>, b: Tensor<1>) -> Tensor<2> {
     let y: Tensor<2> = x.matmul(w.transpose());
     y + b.unsqueeze_dim::<2>(0)

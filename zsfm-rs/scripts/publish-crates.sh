@@ -13,9 +13,9 @@ cd "$(dirname "$0")/.."
 CRATES=(
   zsfm-core
   zsfm-gguf
-  zsfm-hub
-  zsfm-nn
   zsfm-checkpoint
+  zsfm-hub
+  zsfm-burn
   zsfm-chronos
   zsfm-flowstate
   zsfm-lag-llama
