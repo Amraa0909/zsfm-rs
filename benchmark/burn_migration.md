@@ -67,4 +67,12 @@ the `ZSFM_ENGINE`/`zsfm_burn::Engine` seam are deleted. Burn runs Flex CPU.
 - Real-weights `zsfm-bench` comparison per model (needs downloads).
 - Python bindings (`zsfm-python`) now wrap the Burn models (uncompilable in
   CI here — pyo3 needs system Python headers; needs a maturin build check).
+
+## Smoke test (real weights, Burn-only CLI)
+
+- `zsfm ttm convert` pulled `ibm-granite/granite-timeseries-ttm-r2`
+  (134 tensors → 3.2 MB F32 GGUF) with no Python.
+- `zsfm ttm infer` on a 512-step sine+trend context (end ≈33.58),
+  horizon 12: point forecast starts at 33.61 and stays smooth/finite —
+  sane continuation, envelope + usage fields correct.
 - GPU backends (Wgpu/Metal/Cuda) + Fusion + true Q8 inference.
