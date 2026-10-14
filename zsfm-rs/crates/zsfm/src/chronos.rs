@@ -172,31 +172,48 @@ async fn run_infer_burn(
     let mut fc_outputs = Vec::new();
     let mut total_ctx: usize = 0;
     for raw_variates in &contexts {
-        anyhow::ensure!(
-            raw_variates.len() == 1,
-            "Chronos-2 only supports univariate forecasting (1 variate per context)"
-        );
-        let mut ctx = raw_variates[0].clone();
-        anyhow::ensure!(!ctx.is_empty(), "context series must not be empty");
-        total_ctx += ctx.len();
-
-        let total_len = ctx.len();
-        let usable = total_len.min(max_ctx);
+        anyhow::ensure!(!raw_variates.is_empty(), "context series must not be empty");
+        let n_var = raw_variates.len();
+        for (vi, s) in raw_variates.iter().enumerate() {
+            anyhow::ensure!(!s.is_empty(), "context[{vi}] series must not be empty");
+        }
+        let min_len = raw_variates.iter().map(|s| s.len()).min().unwrap_or(0);
+        total_ctx += min_len;
+        let usable = min_len.min(max_ctx);
         let ctx_len = (usable / patch_stride) * patch_stride;
         anyhow::ensure!(
             ctx_len >= patch_size,
-            "context too short — need at least {patch_size} timesteps, got {ctx_len}"
+            "context too short - need at least {patch_size} timesteps, got {ctx_len}"
         );
-        let start = total_len.saturating_sub(ctx_len);
-        ctx = ctx[start..].to_vec();
-
-        eprintln!(
-            "Running forecast ({} context steps → {horizon} future steps) …",
-            ctx.len()
-        );
-        let quantile_mat = model.forecast(&ctx, horizon).context("forecast")?;
-        let qmat: zsfm_core::QuantileMatrix =
-            quantile_mat.into_iter().map(|row| vec![row]).collect();
+        let start = min_len.saturating_sub(ctx_len);
+        let trimmed: Vec<Vec<f32>> = raw_variates
+            .iter()
+            .map(|s| s[start..start + ctx_len].to_vec())
+            .collect();
+        let qmat: zsfm_core::QuantileMatrix = if n_var == 1 {
+            eprintln!(
+                "Running univariate forecast ({} context steps -> {horizon} future steps) ...",
+                ctx_len
+            );
+            let quantile_mat = model.forecast(&trimmed[0], horizon).context("forecast")?;
+            quantile_mat.into_iter().map(|row| vec![row]).collect()
+        } else {
+            eprintln!(
+                "Running multivariate forecast ({} variates x {} context steps -> {horizon} future steps) ...",
+                n_var, ctx_len
+            );
+            let per_variate = model
+                .forecast_multivariate(&trimmed, None, horizon)
+                .context("forecast_multivariate")?;
+            let n_q = per_variate[0].len();
+            let mut out: zsfm_core::QuantileMatrix = vec![vec![Vec::new(); n_var]; n_q];
+            for v in 0..n_var {
+                for q in 0..n_q {
+                    out[q][v] = per_variate[v][q].clone();
+                }
+            }
+            out
+        };
         fc_outputs.push(zsfm_core::quantile_matrix_to_output(
             &qmat,
             &quantile_levels,

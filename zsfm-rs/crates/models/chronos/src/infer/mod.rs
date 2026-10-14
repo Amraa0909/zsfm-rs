@@ -288,7 +288,7 @@ impl BurnChronosModel {
         };
         let total_seq = seq.dims()[0];
         let hidden = seq.unsqueeze_dim::<3>(0);
-        let hidden = self.forward_encoder(hidden, total_seq)?;
+        let hidden = self.forward_encoder(hidden, total_seq, None)?;
         let forecast_embeds: Tensor<3> = hidden.narrow(1, total_seq - n_out_patches, n_out_patches);
         let forecast_embeds: Tensor<2> = forecast_embeds.squeeze_dim(0);
         let quantile_raw = self.forward_residual_block(forecast_embeds, &self.output_patch)?;
@@ -317,14 +317,136 @@ impl BurnChronosModel {
         Ok(result)
     }
 
-    fn forward_encoder(&self, mut x: Tensor<3>, seq_len: usize) -> Result<Tensor<3>> {
+    /// Multivariate forecast: олон хувьсагч, сонголтоор group IDs.
+    /// `[n_variates][n_quantiles][prediction_length]` буцаана.
+    pub fn forecast_multivariate(
+        &self,
+        series: &[Vec<f32>],
+        group_ids: Option<&[usize]>,
+        prediction_length: usize,
+    ) -> Result<Vec<Vec<Vec<f32>>>> {
+        let cfg = &self.config;
+        let ps = cfg.patch_size;
+        let stride = cfg.patch_stride;
+        let n_quantiles = cfg.quantiles.len();
+        let n_out_patches = prediction_length.div_ceil(ps);
+        let n_var = series.len();
+        if n_var == 0 {
+            bail!("forecast_multivariate: empty series list");
+        }
+        let dev = device();
+        let gids: Vec<usize> = match group_ids {
+            Some(g) if g.len() == n_var => g.to_vec(),
+            _ => vec![0usize; n_var],
+        };
+        let mut mask_data = vec![0.0f32; n_var * n_var];
+        for i in 0..n_var {
+            for j in 0..n_var {
+                if gids[i] != gids[j] {
+                    mask_data[i * n_var + j] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        let group_mask: Tensor<2> =
+            Tensor::from_data(TensorData::new(mask_data, [n_var, n_var]), &dev);
+        let feat_dim = 3 * ps;
+        let mut all_ctx: Vec<f32> = Vec::new();
+        let mut locs: Vec<f32> = Vec::with_capacity(n_var);
+        let mut scales: Vec<f32> = Vec::with_capacity(n_var);
+        let mut n_ctx_patches = 0usize;
+        for (v, ctx) in series.iter().enumerate() {
+            let (normalized, loc, scale) = instance_norm(ctx, cfg.use_arcsinh);
+            locs.push(loc);
+            scales.push(scale);
+            let padded = pad_for_patching(&normalized, ps);
+            let np = (padded.len() - ps) / stride + 1;
+            if v == 0 {
+                n_ctx_patches = np;
+            }
+            if np != n_ctx_patches {
+                bail!("forecast_multivariate: all variates must have same length");
+            }
+            let feats = build_patch_features(
+                &padded, np, ps, stride,
+                -((np * ps) as f32),
+                cfg.time_encoding_scale as f32,
+                true,
+            );
+            all_ctx.extend(feats);
+        }
+        let fut_feats = build_patch_features_future(
+            n_out_patches, ps, 0.0, cfg.time_encoding_scale as f32,
+        );
+        let mut all_fut: Vec<f32> = Vec::with_capacity(n_var * n_out_patches * feat_dim);
+        for _ in 0..n_var {
+            all_fut.extend_from_slice(&fut_feats);
+        }
+        let ctx_tensor: Tensor<2> = Tensor::from_data(
+            TensorData::new(all_ctx, [n_var * n_ctx_patches, feat_dim]), &dev,
+        );
+        let fut_tensor: Tensor<2> = Tensor::from_data(
+            TensorData::new(all_fut, [n_var * n_out_patches, feat_dim]), &dev,
+        );
+        let ctx_flat = self.forward_residual_block(ctx_tensor, &self.input_patch)?;
+        let fut_flat = self.forward_residual_block(fut_tensor, &self.input_patch)?;
+        let d = cfg.d_model;
+        let ctx_embeds: Tensor<3> = ctx_flat.reshape([n_var, n_ctx_patches, d]);
+        let fut_embeds: Tensor<3> = fut_flat.reshape([n_var, n_out_patches, d]);
+        let seq = if cfg.use_reg_token {
+            let reg_2d: Tensor<2> = self.token_embd.clone().narrow(0, 1, 1);
+            let reg_3d: Tensor<3> = reg_2d.reshape([1, 1, d]);
+            let reg_b: Tensor<3> = Tensor::zeros([n_var, 1, d], &dev) + reg_3d;
+            Tensor::cat(vec![ctx_embeds, reg_b, fut_embeds], 1)
+        } else {
+            Tensor::cat(vec![ctx_embeds, fut_embeds], 1)
+        };
+        let total_seq = seq.dims()[1];
+        let hidden = self.forward_encoder(seq, total_seq, Some(&group_mask))?;
+        let forecast_embeds: Tensor<3> =
+            hidden.narrow(1, total_seq - n_out_patches, n_out_patches);
+        let forecast_flat: Tensor<2> =
+            forecast_embeds.reshape([n_var * n_out_patches, d]);
+        let quantile_raw =
+            self.forward_residual_block(forecast_flat, &self.output_patch)?;
+        let total_out = n_out_patches * ps;
+        let qmat: Tensor<4> =
+            quantile_raw.reshape([n_var, n_out_patches, n_quantiles, ps]);
+        let qmat: Tensor<4> = qmat.permute([0, 2, 1, 3]);
+        let qmat: Tensor<3> = qmat.reshape([n_var, n_quantiles, total_out]);
+        let qmat: Tensor<3> = if total_out > prediction_length {
+            qmat.narrow(2, 0, prediction_length)
+        } else {
+            qmat
+        };
+        let data: Vec<f32> = qmat
+            .to_data()
+            .try_to_vec()
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let mut result =
+            vec![vec![vec![0.0f32; prediction_length]; n_quantiles]; n_var];
+        for v in 0..n_var {
+            for q in 0..n_quantiles {
+                for t in 0..prediction_length {
+                    let idx = v * n_quantiles * prediction_length
+                        + q * prediction_length
+                        + t;
+                    let raw = data[idx] as f64;
+                    let v_denorm = if cfg.use_arcsinh { raw.sinh() } else { raw };
+                    result[v][q][t] = (v_denorm as f32) * scales[v] + locs[v];
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn forward_encoder(&self, mut x: Tensor<3>, seq_len: usize, group_mask: Option<&Tensor<2>>) -> Result<Tensor<3>> {
         for blk in &self.blocks {
-            x = self.forward_block(x, blk, seq_len)?;
+            x = self.forward_block(x, blk, seq_len, group_mask)?;
         }
         Ok(rms(x, self.enc_norm.clone(), self.config.layer_norm_eps))
     }
 
-    fn forward_block(&self, x: Tensor<3>, blk: &BurnBlockW, seq_len: usize) -> Result<Tensor<3>> {
+    fn forward_block(&self, x: Tensor<3>, blk: &BurnBlockW, seq_len: usize, group_mask: Option<&Tensor<2>>) -> Result<Tensor<3>> {
         let normed = rms(
             x.clone(),
             blk.time_attn.norm_w.clone(),
@@ -337,7 +459,7 @@ impl BurnChronosModel {
             blk.group_attn.norm_w.clone(),
             self.config.layer_norm_eps,
         );
-        let grp_out = self.forward_group_attn_univariate(normed, &blk.group_attn);
+        let grp_out = self.forward_group_attn_full(normed, &blk.group_attn, group_mask);
         let x = x + grp_out;
         let normed = rms(
             x.clone(),
@@ -349,6 +471,7 @@ impl BurnChronosModel {
     }
 
     fn forward_time_attn(&self, x: Tensor<3>, w: &BurnAttnW, seq_len: usize) -> Tensor<3> {
+        let batch = x.dims()[0];
         let id = self.config.num_heads * self.config.d_kv;
         let nh = self.config.num_heads;
         let dkv = self.config.d_kv;
@@ -356,22 +479,59 @@ impl BurnChronosModel {
         let q: Tensor<3> = qkv.clone().narrow(2, 0, id);
         let k: Tensor<3> = qkv.clone().narrow(2, id, id);
         let v: Tensor<3> = qkv.narrow(2, 2 * id, id);
-        let pack = |t: Tensor<3>| t.reshape([1, seq_len, nh, dkv]).permute([0, 2, 1, 3]);
+        let pack = |t: Tensor<3>| t.reshape([batch, seq_len, nh, dkv]).permute([0, 2, 1, 3]);
         let (q, k, v) = (pack(q), pack(k), pack(v));
         let q = apply_llama_rope(q, self.rope_cos.clone(), self.rope_sin.clone(), 0);
         let k = apply_llama_rope(k, self.rope_cos.clone(), self.rope_sin.clone(), 0);
         let scores = q.matmul(k.transpose());
         let attn = softmax_last(scores);
         let out = attn.matmul(v);
-        let out: Tensor<3> = out.permute([0, 2, 1, 3]).reshape([1, seq_len, id]);
+        let out: Tensor<3> = out.permute([0, 2, 1, 3]).reshape([batch, seq_len, id]);
         linear(out, w.o_w.clone(), None)
     }
 
-    fn forward_group_attn_univariate(&self, x: Tensor<3>, w: &BurnAttnW) -> Tensor<3> {
-        let id = self.config.num_heads * self.config.d_kv;
+    fn forward_group_attn_full(
+        &self,
+        x: Tensor<3>,
+        w: &BurnAttnW,
+        group_mask: Option<&Tensor<2>>,
+    ) -> Tensor<3> {
+        let batch = x.dims()[0];
+        let seq = x.dims()[1];
+        let nh = self.config.num_heads;
+        let dkv = self.config.d_kv;
+        let id = nh * dkv;
+        if batch == 1 {
+            let qkv = linear(x, w.qkv_w.clone(), None);
+            let v: Tensor<3> = qkv.narrow(2, 2 * id, id);
+            return linear(v, w.o_w.clone(), None);
+        }
         let qkv = linear(x, w.qkv_w.clone(), None);
+        let q: Tensor<3> = qkv.clone().narrow(2, 0, id);
+        let k: Tensor<3> = qkv.clone().narrow(2, id, id);
         let v: Tensor<3> = qkv.narrow(2, 2 * id, id);
-        linear(v, w.o_w.clone(), None)
+        let to_hsb = |t: Tensor<3>| -> Tensor<4> {
+            t.reshape([batch, seq, nh, dkv]).permute([2, 1, 0, 3])
+        };
+        let q: Tensor<4> = to_hsb(q);
+        let k: Tensor<4> = to_hsb(k);
+        let v: Tensor<4> = to_hsb(v);
+        let q: Tensor<3> = q.reshape([nh * seq, batch, dkv]);
+        let k: Tensor<3> = k.reshape([nh * seq, batch, dkv]);
+        let v: Tensor<3> = v.reshape([nh * seq, batch, dkv]);
+        let scores = q.matmul(k.transpose());
+        let scores = match group_mask {
+            Some(m) => {
+                let m3: Tensor<3> = (*m).clone().unsqueeze_dim::<3>(0);
+                scores + m3
+            }
+            None => scores,
+        };
+        let attn = softmax_last(scores);
+        let out = attn.matmul(v);
+        let out: Tensor<4> = out.reshape([nh, seq, batch, dkv]).permute([2, 1, 0, 3]);
+        let out: Tensor<3> = out.reshape([batch, seq, id]);
+        linear(out, w.o_w.clone(), None)
     }
 
     fn forward_ffn(&self, x: Tensor<3>, w: &BurnFfnW) -> Result<Tensor<3>> {

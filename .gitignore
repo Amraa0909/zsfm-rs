@@ -48,3 +48,10 @@ hf_openapi.md
 # repo root for default invocations). Anchored so it never matches the
 # `zsfm-rs/crates/models/` source tree.
 /models/
+# Multivariate test artifacts
+build*.log
+convert*.log
+ohlc.csv
+ohlc.json
+my_ohlc.json
+*.bak
