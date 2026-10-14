@@ -116,3 +116,22 @@ GitHub: https://github.com/Amraa0909/zsfm-rs
 
 ### Жишээ stderr
     Running multivariate forecast (4 variates x 32 context steps -> 8 future steps, group_ids=[0, 0, 1, 1]) ...
+
+
+## 📈 OHLCV жишээ (5 variate)
+
+### Тестийн өгөгдөл
+- 48 өдрийн хиймэл OHLCV
+- 32 context + 10 forecast
+- group_ids = [0,0,0,0,0] (бүгд нэг бүлэгт)
+
+### Үр дүн
+- 5 variate x 10 өдөр
+- OHLCV логик: 9/10 raw, 10/10 post-processed
+- Volume scale: ~1M тогтвортой
+- Close 80% интервал (D+1): [122.27, 126.43]
+
+### Volume-ийн онцлог
+- OHLC (~100) vs Volume (~1M) — 10,000 дахин ялгаа
+- Instance normalization нь variate тус бүрд тусдаа хийгддэг тул асуудалгүй
+- Post-processing: Volume > 0 (max(0, x))
