@@ -135,3 +135,25 @@ GitHub: https://github.com/Amraa0909/zsfm-rs
 - OHLC (~100) vs Volume (~1M) — 10,000 дахин ялгаа
 - Instance normalization нь variate тус бүрд тусдаа хийгддэг тул асуудалгүй
 - Post-processing: Volume > 0 (max(0, x))
+
+
+## 📈 Жинхэнэ BTCUSDT тест (Binance API)
+
+### Өгөгдөл татах
+Binance API нь API key шаарддаггүй:
+    curl -s 'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=32' -o btc_raw.json
+
+### Формат
+Binance kline: [open_time, open, high, low, close, volume, close_time, ...]
+Chronos формат: 5 variate = [Open, High, Low, Close, Volume]
+
+### Үр дүн (жишээ)
+- OHLCV логик: 10/10 PASS
+- 80% интервал D+1 (Close): [79863 .. 84497], spread 4634
+- 80% интервал D+10 (Close): [75559 .. 86469], spread 10910
+- Spread цаг хугацаанд өсөж байна (зөв зан төлөв)
+
+### Шаардлагатай домэйнууд (hosts файлд)
+- api.binance.com
+- api1.binance.com
+- api2.binance.com
