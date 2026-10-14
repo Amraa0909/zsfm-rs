@@ -88,3 +88,31 @@ l_fixed = [min(o[i], l[i], c[i]) for i in range(len(o))]
 Rust: 1.82+
 Загвар: amazon/chronos-2 (120M параметр, Q8)
 GitHub: https://github.com/Amraa0909/zsfm-rs
+
+
+## 🎯 Group IDs (--group-ids)
+
+Олон хувьсагчийг бүлэгт хувааж, зөвхөн ижил бүлгийн хувьсагчид хоорондоо attention хийхийг хязгаарлаж болно.
+
+### CLI-д
+    zsfm chronos infer --group-ids 0,0,1,1
+
+### JSON-д
+    {"context": [[[v1], [v2], [v3], [v4]]], "horizon": 8, "group_ids": [0, 0, 1, 1]}
+
+### Дарааллын дүрэм (precedence)
+1. --group-ids (CLI) — хамгийн өндөр эрх
+2. group_ids (JSON) — CLI байхгүй бол
+3. None — бүх variate нэг бүлэгт (анхдагч)
+
+### Хэрэглээ
+- Санхүү: OHLC бүгд нэг бүлэгт (хамааралтай)
+- Олон хөрөнгө: Хувьцаа, бонд, алт тус тусдаа бүлэгт
+- Sensor: Өөр өөр газар байрлах sensor-ууд тусдаа бүлэгт
+
+### Валидаци
+- --group-ids урт нь variate тоотой тэнцүү байх ёстой
+- Алдаа: --group-ids / group_ids length N != variate count M
+
+### Жишээ stderr
+    Running multivariate forecast (4 variates x 32 context steps -> 8 future steps, group_ids=[0, 0, 1, 1]) ...
