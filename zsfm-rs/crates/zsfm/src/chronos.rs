@@ -45,6 +45,11 @@ pub enum Command {
         gguf: PathBuf,
         #[arg(long, default_value = "models/amazon__chronos-2/config.json")]
         config: PathBuf,
+        /// Group IDs for multivariate forecasting (comma-separated, e.g. "0,0,1,1").
+        /// Variates with the same group ID attend to each other; different groups are isolated.
+        /// If omitted, all variates share one group. Can also be supplied via JSON: {"group_ids": [0,0,1,1]}.
+        #[arg(long)]
+        group_ids: Option<String>,
     },
     /// Upload source + GGUF files to HuggingFace Hub.
     Upload {
@@ -135,8 +140,8 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
 
         Command::InspectTensors { path } => crate::common::inspect_tensors(&path)?,
 
-        Command::Infer { gguf, config } => {
-            return run_infer_burn(&gguf, &config).await;
+        Command::Infer { gguf, config, group_ids } => {
+            return run_infer_burn(&gguf, &config, group_ids).await;
         }
     }
 
@@ -146,6 +151,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
 async fn run_infer_burn(
     gguf: &std::path::PathBuf,
     config: &std::path::PathBuf,
+    cli_group_ids: Option<String>,
 ) -> anyhow::Result<()> {
     use zsfm_chronos::infer::BurnChronosModel;
 
@@ -154,6 +160,27 @@ async fn run_infer_burn(
 
     let contexts = zsfm_core::parse_mv_contexts(req["context"].clone())?;
     let horizon = zsfm_core::parse_horizon(&req)?;
+
+    // Group IDs precedence: --group-ids (CLI) > JSON "group_ids" > None (all one group).
+    let req_group_ids: Option<Vec<usize>> = req
+        .get("group_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_u64().map(|n| n as usize))
+                .collect::<Vec<_>>()
+        });
+    let group_ids: Option<Vec<usize>> = if let Some(s) = cli_group_ids.as_deref() {
+        let parsed: Result<Vec<usize>, _> = s
+            .split(',')
+            .map(|p| p.trim().parse::<usize>())
+            .collect();
+        Some(parsed.context(
+            "--group-ids: expected comma-separated integers, e.g. \"0,0,1,1\"",
+        )?)
+    } else {
+        req_group_ids
+    };
 
     let config_str =
         std::fs::read_to_string(config).with_context(|| format!("read {}", config.display()))?;
@@ -198,12 +225,28 @@ async fn run_infer_burn(
             let quantile_mat = model.forecast(&trimmed[0], horizon).context("forecast")?;
             quantile_mat.into_iter().map(|row| vec![row]).collect()
         } else {
+            let groups_for_this: Option<&[usize]> = match group_ids.as_deref() {
+                Some(g) => {
+                    anyhow::ensure!(
+                        g.len() == n_var,
+                        "--group-ids / group_ids length {} != variate count {}",
+                        g.len(),
+                        n_var
+                    );
+                    Some(g)
+                }
+                None => None,
+            };
+            let groups_msg = match groups_for_this {
+                Some(g) => format!(", group_ids={g:?}"),
+                None => String::new(),
+            };
             eprintln!(
-                "Running multivariate forecast ({} variates x {} context steps -> {horizon} future steps) ...",
-                n_var, ctx_len
+                "Running multivariate forecast ({} variates x {} context steps -> {horizon} future steps{}) ...",
+                n_var, ctx_len, groups_msg
             );
             let per_variate = model
-                .forecast_multivariate(&trimmed, None, horizon)
+                .forecast_multivariate(&trimmed, groups_for_this, horizon)
                 .context("forecast_multivariate")?;
             let n_q = per_variate[0].len();
             let mut out: zsfm_core::QuantileMatrix = vec![vec![Vec::new(); n_var]; n_q];
