@@ -24,7 +24,7 @@ members = [
     "zsfm-rs/crates/zsfm",
     "zsfm-rs/crates/zsfm-python",
     "zsfm-rs/crates/zsfm-bench",
-    "zsfm-rs/crates/zsfm-burn",
+    "zsfm-rs/crates/zsfm-burn", "probability_analysis", "prob_rust",
 ]
 
 [workspace.package]

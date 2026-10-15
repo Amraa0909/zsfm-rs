@@ -518,12 +518,12 @@ impl BurnTotoModel {
         let out: Tensor<5> = x.reshape([1, n_var, fcst_patches, patch_size, 9]);
         let out: Tensor<5> = out.permute([4, 0, 1, 2, 3]);
         let out: Tensor<3> = out.reshape([9, n_var, fcst_steps]);
-        let h = out.dims()[2];
         let out: Tensor<3> = if fcst_steps > prediction_length {
             out.narrow(2, 0, prediction_length)
         } else {
             out
         };
+        let h = out.dims()[2];
         let out_data: Vec<f32> = out
             .to_data()
             .try_to_vec()
