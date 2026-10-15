@@ -280,3 +280,34 @@ Chronos формат: 5 variate = [Open, High, Low, Close, Volume]
 - Хоёулаа бууралт таамаглаж байна (1.2-1.3%)
 - Toto интервал 10-20% нарийссан
 - Volume 20% зөрүү (хэвийн, дуу чимээтэй)
+
+
+## 📊 Technical Indicators + Candlestick Patterns (XAUUSD)
+
+### Indicators (D+10, Chronos-2 / Toto 22M)
+| Indicator | Chronos-2 | Toto 22M |
+|-----------|-----------|----------|
+| RSI (14) | 49.3 | 49.6 |
+| MACD | 6.85 / 10.36 | 5.22 / 7.84 |
+| Stochastic K | 28.6 | 35.0 |
+| ATR (14) | 40.09 | 49.20 |
+| BB position | Inside | Inside |
+
+### Consensus Signal
+- **MACD:** Bearish cross (хоёулаа)
+- **RSI:** Neutral ~50
+- **Stoch:** Oversold орчим
+- **SMA5 vs SMA20:** Death cross бүрэлдэж байна
+
+### Candlestick Patterns
+- **Chronos-2:** SpinTop (9/10) — тодорхойгүй байдал
+- **Toto 22M:** Hammer, Doji, 3WhiteSold, SpinTop — илүү олон янз
+- **Pattern agreement:** 4/10
+
+### Trading Signals
+- D+1-5: **Short** (bearish momentum)
+- D+6-9: **Анхаар** (Stoch oversold)
+- D+9-10: **Potential bounce**
+
+### Indicators.py (script)
+ нь Chronos-2 + Toto-2-ын forecast-оос RSI, MACD, BB, ATR, Stochastic болон 10+ candlestick паттерныг тооцоолдог.
