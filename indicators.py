@@ -10,7 +10,7 @@ req = {'context': [variates_ctx], 'horizon': 10, 'group_ids': [0]*n_var}
 print("Running Chronos-2...", file=sys.stderr)
 ch_proc = subprocess.run(
     ['./target/release/zsfm', 'chronos', 'infer',
-     '--gguf', 'gguf/chronos-f16.gguf',
+     '--gguf', 'gguf/chronos-q8.gguf',
      '--config', 'models/amazon__chronos-2/config.json',
      '--group-ids', ','.join(['0']*n_var)],
     input=json.dumps(req), capture_output=True, text=True, timeout=600

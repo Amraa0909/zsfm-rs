@@ -32,7 +32,7 @@ To free disk, remove the cache (and optionally an output file):
 
 ```bash
 zsfm chronos delete                          # removes models/amazon__chronos-2/
-zsfm chronos delete --output gguf/chronos-f16.gguf  # also removes the converted file
+zsfm chronos delete --output gguf/chronos-q8.gguf  # also removes the converted file
 ```
 
 Pass `--redownload` to force a fresh download anyway (e.g. the upstream repo was updated):

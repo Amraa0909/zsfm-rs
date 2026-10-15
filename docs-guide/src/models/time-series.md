@@ -57,7 +57,7 @@ Paper: [Chronos-2: From Univariate to Universal Forecasting](https://arxiv.org/a
 
 ```bash
 zsfm chronos convert
-echo '{"context": [1,2,3,4,5,6,7,8], "horizon": 4}' | zsfm chronos infer --gguf gguf/chronos-f16.gguf
+echo '{"context": [1,2,3,4,5,6,7,8], "horizon": 4}' | zsfm chronos infer --gguf gguf/chronos-q8.gguf
 ```
 
 Univariate only. Full quantile levels in the response; `"point"` is the median (q0.5).

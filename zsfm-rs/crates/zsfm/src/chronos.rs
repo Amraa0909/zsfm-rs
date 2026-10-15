@@ -20,7 +20,7 @@ pub enum Command {
     Convert {
         #[arg(short, long, default_value = "amazon/chronos-2")]
         model: String,
-        #[arg(short, long, default_value = "gguf/chronos-f16.gguf")]
+        #[arg(short, long, default_value = "gguf/chronos-q8.gguf")]
         output: PathBuf,
         #[arg(long, default_value = "f16")]
         dtype: DtypeArg,
@@ -41,7 +41,7 @@ pub enum Command {
     /// Outputs a JSON forecast in OpenAI-compatible format with all quantile levels.
     /// The `point` field contains the median quantile (q0.5). Univariate only.
     Infer {
-        #[arg(short, long, default_value = "gguf/chronos-f16.gguf")]
+        #[arg(short, long, default_value = "gguf/chronos-q8.gguf")]
         gguf: PathBuf,
         #[arg(long, default_value = "models/amazon__chronos-2/config.json")]
         config: PathBuf,

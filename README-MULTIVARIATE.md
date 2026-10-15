@@ -7,7 +7,7 @@ Amazon-ы Chronos-2 (120M параметр) загварыг Rust дээр Termu
 - Эх репо: https://github.com/amaye15/zsfm-rs
 - Fork: https://github.com/Amraa0909/zsfm-rs
 - Загвар: amazon/chronos-2 (HuggingFace)
-- GGUF: gguf/chronos-f16.gguf (127MB, Q8 формат)
+- GGUF: gguf/chronos-q8.gguf (127MB, Q8 формат)
 
 ## 🛠️ Хийсэн өөрчлөлтүүд
 
@@ -48,10 +48,10 @@ cd ~/zsfm-rs
 ./target/release/zsfm chronos convert --dtype q8
 
 ### Univariate тест
-echo '{"context": [1,2,...,32], "horizon": 8}' | ./target/release/zsfm chronos infer --gguf gguf/chronos-f16.gguf --config models/amazon__chronos-2/config.json
+echo '{"context": [1,2,...,32], "horizon": 8}' | ./target/release/zsfm chronos infer --gguf gguf/chronos-q8.gguf --config models/amazon__chronos-2/config.json
 
 ### Multivariate тест (3 variate)
-echo '{"context": [[[1,2,...,32],[100,101,...,131],[1000,1010,...,1310]]], "horizon": 8}' | ./target/release/zsfm chronos infer --gguf gguf/chronos-f16.gguf --config models/amazon__chronos-2/config.json
+echo '{"context": [[[1,2,...,32],[100,101,...,131],[1000,1010,...,1310]]], "horizon": 8}' | ./target/release/zsfm chronos infer --gguf gguf/chronos-q8.gguf --config models/amazon__chronos-2/config.json
 
 ## ⚠️ Мэдэгдэж буй асуудлууд
 

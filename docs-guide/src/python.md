@@ -55,7 +55,7 @@ point = model.forecast(context, horizon=4)
 print(point)  # [12.3, 12.5, 12.6, 12.7]
 
 # Chronos-2 exposes quantiles as well
-chronos = zsfm.ChronosModel("gguf/chronos-f16.gguf")
+chronos = zsfm.ChronosModel("gguf/chronos-q8.gguf")
 qmat = chronos.forecast_quantiles([1,2,3,4,5,6,7,8], horizon=4)  # [n_quantiles][horizon]
 print(chronos.quantiles())  # [0.1, 0.2, ..., 0.9]
 

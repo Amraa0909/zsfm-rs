@@ -70,7 +70,7 @@ fn run_model(model: &str, input_json: &str) -> Result<Vec<ForecastOutput>, Strin
             "../target/release/zsfm",
             vec![
                 "chronos", "infer",
-                "--gguf", "../gguf/chronos-f16.gguf",
+                "--gguf", "../gguf/chronos-q8.gguf",
                 "--config", "../models/amazon__chronos-2/config.json",
                 "--group-ids", "0,0,0,0,0",
             ],

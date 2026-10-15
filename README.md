@@ -18,7 +18,7 @@ There are two halves — plus a cleanup helper:
 
 1. **Convert** — `zsfm <model> convert` downloads the model's real weights from Hugging Face and writes a single `*.gguf` file.
 2. **Infer** — `zsfm <model> infer --gguf <file> < request.json` loads that GGUF and returns a forecast / tabular prediction. No PyTorch, no Python runtime.
-3. **Delete** — `zsfm <model> delete` removes the cached `model-f32.gguf` + `config.json` (and optionally an output GGUF) to free disk (`zsfm chronos delete --output gguf/chronos-f16.gguf`).
+3. **Delete** — `zsfm <model> delete` removes the cached `model-f32.gguf` + `config.json` (and optionally an output GGUF) to free disk (`zsfm chronos delete --output gguf/chronos-q8.gguf`).
 
 The same GGUF file works with any GGUF consumer; `infer` just happens to use Burn.
 
@@ -152,7 +152,7 @@ Univariate models use a flat array instead:
 
 ```bash
 zsfm chronos convert
-echo '{"context": [1,2,3,4,5,6,7,8], "horizon": 4}' | zsfm chronos infer --gguf gguf/chronos-f16.gguf
+echo '{"context": [1,2,3,4,5,6,7,8], "horizon": 4}' | zsfm chronos infer --gguf gguf/chronos-q8.gguf
 ```
 
 ### Tabular prediction (Mitra)
@@ -252,7 +252,7 @@ To free disk, remove the cache (and optionally an output file):
 
 ```bash
 zsfm chronos delete                          # removes models/amazon__chronos-2/
-zsfm chronos delete --output gguf/chronos-f16.gguf  # also removes the converted file
+zsfm chronos delete --output gguf/chronos-q8.gguf  # also removes the converted file
 zsfm chronos delete --model custom/repo --model-dir /tmp/models  # custom locations
 ```
 

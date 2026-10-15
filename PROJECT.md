@@ -23,7 +23,7 @@ Amazon-ы Chronos-2 болон Datadog-ийн Toto-2 загваруудыг Rust
 
 ### Chronos-2 (Amazon)
 - HuggingFace: amazon/chronos-2
-- Параметр: 120M | Файл: gguf/chronos-f16.gguf (127MB, Q8)
+- Параметр: 120M | Файл: gguf/chronos-q8.gguf (127MB, Q8)
 - Config: models/amazon__chronos-2/config.json
 - Quantile: 24 түвшин (0.01-0.99)
 - Архитектур: Encoder-only T5 | Multivariate: GroupSelfAttention | Context: 8192
@@ -161,13 +161,13 @@ Volume нь Chronos-2-д чиглэл өгдөг. Volume-гүй үед flat, Vol
 ## 5. Ашиглах командууд
 
 ### 5.1 Chronos-2 Univariate
-echo '{"context": [[1,2,...,32]], "horizon": 10}' | ./target/release/zsfm chronos infer --gguf gguf/chronos-f16.gguf --config models/amazon__chronos-2/config.json
+echo '{"context": [[1,2,...,32]], "horizon": 10}' | ./target/release/zsfm chronos infer --gguf gguf/chronos-q8.gguf --config models/amazon__chronos-2/config.json
 
 ### 5.2 Chronos-2 Multivariate (3 variate)
-echo '{"context": [[[1,2,...,32],[100,...,131],[1000,...,1310]]], "horizon": 10}' | ./target/release/zsfm chronos infer --gguf gguf/chronos-f16.gguf --config models/amazon__chronos-2/config.json --group-ids 0,0,0
+echo '{"context": [[[1,2,...,32],[100,...,131],[1000,...,1310]]], "horizon": 10}' | ./target/release/zsfm chronos infer --gguf gguf/chronos-q8.gguf --config models/amazon__chronos-2/config.json --group-ids 0,0,0
 
 ### 5.3 Chronos-2 Multivariate (2 groups)
-echo '{"context": [[[v1],[v2],[v3],[v4]]], "horizon": 10, "group_ids": [0,0,1,1]}' | ./target/release/zsfm chronos infer --gguf gguf/chronos-f16.gguf --config models/amazon__chronos-2/config.json
+echo '{"context": [[[v1],[v2],[v3],[v4]]], "horizon": 10, "group_ids": [0,0,1,1]}' | ./target/release/zsfm chronos infer --gguf gguf/chronos-q8.gguf --config models/amazon__chronos-2/config.json
 
 ### 5.4 Toto-2 22M
 echo '{"context": [[[1,2,...,32],[100,...,131]]], "horizon": 10}' | ./target/release/zsfm toto infer --gguf gguf/toto-22m-q8.gguf --config models/Datadog__Toto-2.0-22m/config.json
@@ -188,7 +188,7 @@ cd ~/zsfm-rs/prob_rust && ~/zsfm-rs/target/release/prob_rust 2>&1 | tee prob.log
 ├── VALIDATION.md                     <- Backtest дүгнэлт
 ├── Cargo.toml
 ├── gguf/
-│   ├── chronos-f16.gguf              (127MB, Q8)
+│   ├── chronos-q8.gguf              (127MB, Q8)
 │   └── toto-22m-q8.gguf              (35MB, Q8)
 ├── models/
 │   ├── amazon__chronos-2/

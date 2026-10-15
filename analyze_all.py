@@ -40,7 +40,7 @@ def run_backtest(model, close_data, n_tests=150):
         if model == 'chronos':
             req['group_ids'] = [0]
             args = ['./target/release/zsfm','chronos','infer',
-                    '--gguf','gguf/chronos-f16.gguf',
+                    '--gguf','gguf/chronos-q8.gguf',
                     '--config','models/amazon__chronos-2/config.json',
                     '--group-ids','0']
         else:
@@ -102,7 +102,7 @@ req_2g = {'context': [ctx_all], 'horizon': 10, 'group_ids': [0,0,0,0,0,1,1,1,1,1
 print("Running Chronos-2 with 2 groups...", file=sys.stderr)
 proc = subprocess.run(
     ['./target/release/zsfm','chronos','infer',
-     '--gguf','gguf/chronos-f16.gguf',
+     '--gguf','gguf/chronos-q8.gguf',
      '--config','models/amazon__chronos-2/config.json',
      '--group-ids','0,0,0,0,0,1,1,1,1,1'],
     input=json.dumps(req_2g), capture_output=True, text=True, timeout=900)
@@ -132,7 +132,7 @@ print("=" * 100)
 req_gold = {'context': [ctx_gold], 'horizon': 10, 'group_ids': [0,0,0,0,0]}
 proc_g = subprocess.run(
     ['./target/release/zsfm','chronos','infer',
-     '--gguf','gguf/chronos-f16.gguf',
+     '--gguf','gguf/chronos-q8.gguf',
      '--config','models/amazon__chronos-2/config.json',
      '--group-ids','0,0,0,0,0'],
     input=json.dumps(req_gold), capture_output=True, text=True, timeout=600)

@@ -192,7 +192,7 @@ fn convert(
                 let repo = "amazon/chronos-2";
                 let out = output
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("gguf/chronos-f16.gguf"));
+                    .unwrap_or_else(|| PathBuf::from("gguf/chronos-q8.gguf"));
                 let canonical = zsfm_hub::canonical_gguf_path(&model_dir, repo);
                 if canonical.exists() && !redownload {
                     zsfm_checkpoint::recast(&canonical, &out, dtype_ty)

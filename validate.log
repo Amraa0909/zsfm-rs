@@ -1,0 +1,107 @@
+Loading BTCUSDT backtests...
+
+======================================================================
+=== CHRONOS-2 (BTCUSDT) ===
+======================================================================
+
+Basic metrics (n=150):
+  MAE:     mean=2866.97, median=1772.68, stdev=2439.61
+  RMSE:    mean=3279.89, median=2218.35
+  RMSE/MAE ratio: 1.14 (OK)
+
+Direction accuracy:
+  Mean: 49.7%
+  >=55%: 51/150 (34%)
+  >=60%: 51/150 (34%)
+  >=70%: 26/150 (17%)
+  Assessment: RANDOM (efficient market)
+
+Coverage (target 80%):
+  Mean: 75.5%
+  Well-calibrated (70-90%): 28/150
+  Overconfident (<70%):     46/150
+  Underconfident (>90%):    76/150
+  Assessment: CALIBRATED
+
+Risk metrics:
+  VaR 95%:  $8125.71 (5% worst case)
+  CVaR 95%: $9987.11 (avg of worst 5%)
+  Max MAE:  $12638.97 (worst window)
+
+Consistency:
+  MAE < median: 50%
+  MAE p10-p90 range: $883.53 - $6639.64
+
+======================================================================
+=== TOTO 22M (BTCUSDT) ===
+======================================================================
+
+Basic metrics (n=150):
+  MAE:     mean=2646.84, median=1673.32, stdev=2299.77
+  RMSE:    mean=3013.66, median=1948.68
+  RMSE/MAE ratio: 1.14 (OK)
+
+Direction accuracy:
+  Mean: 49.3%
+  >=55%: 53/150 (35%)
+  >=60%: 53/150 (35%)
+  >=70%: 23/150 (15%)
+  Assessment: RANDOM (efficient market)
+
+Coverage (target 80%):
+  Mean: 77.2%
+  Well-calibrated (70-90%): 30/150
+  Overconfident (<70%):     41/150
+  Underconfident (>90%):    79/150
+  Assessment: CALIBRATED
+
+Risk metrics:
+  VaR 95%:  $8089.19 (5% worst case)
+  CVaR 95%: $9603.94 (avg of worst 5%)
+  Max MAE:  $11990.14 (worst window)
+
+Consistency:
+  MAE < median: 50%
+  MAE p10-p90 range: $811.85 - $6016.04
+
+======================================================================
+=== FINAL COMPARISON (BTCUSDT) ===
+======================================================================
+Metric                       Chronos-2        Toto 22M     Winner
+----------------------------------------------------------------------
+Avg MAE                        2866.97         2646.84       Toto
+Median MAE                     1772.68         1673.32       Toto
+Avg RMSE                       3279.89         3013.66       Toto
+Direction %                      49.67           49.33    Chronos
+Coverage %                       75.50           77.17       Toto
+VaR 95%                        8125.71         8089.19       Toto
+CVaR 95%                       9987.11         9603.94       Toto
+Max MAE                       12638.97        11990.14       Toto
+
+Overall score: Chronos-2 1/4, Toto 22M 3/4
+=> Winner: TOTO 22M
+
+======================================================================
+=== USABILITY CHECK ===
+======================================================================
+
+Chronos-2:
+  MAE < 5% of price?     YES ($1773)
+  Direction >= 55%?      NO (random) (49.7%)
+  Coverage 75-85%?       YES (75.5%)
+  => Usable for trading? NO - probabilistic only
+
+Toto 22M:
+  MAE < 5% of price?     YES ($1673)
+  Direction >= 55%?      NO (random) (49.3%)
+  Coverage 75-85%?       YES (77.2%)
+  => Usable for trading? NO - probabilistic only
+
+======================================================================
+=== RECOMMENDATION ===
+======================================================================
+Direction ~50% => Use ONLY for probabilistic forecasts
+  - Risk management (VaR, CVaR)
+  - Volatility estimation
+  - Confidence intervals
+  NOT for directional trading (long/short)
