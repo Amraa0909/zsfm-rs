@@ -242,3 +242,41 @@ Chronos формат: 5 variate = [Open, High, Low, Close, Volume]
 - ✅ **Risk management** (VaR)
 - ✅ **Volatility estimation**
 - ❌ **Directional trading** (long/short signal)
+
+
+## 🥇 XAUUSD (Gold) — Chronos-2 vs Toto 2.0 22M
+
+### Өгөгдөл
+- Эх сурвалж: GitHub (XAUUSD-Gold-Price, 2004-2025)
+- 5392 өдрийн OHLCV
+- Сүүлийн 32 өдрийн context
+
+### Model Agreement (10 өдөр)
+| Variate | Avg Diff | % Diff |
+|---------|----------|--------|
+| Open | $10.04 | 0.30% |
+| High | $11.96 | 0.35% |
+| Low | $17.53 | 0.52% |
+| Close | $11.07 | 0.33% |
+| Volume | 24,071 | 19.92% |
+
+### OHLCV Logic
+- Chronos-2: 10/10 PASS
+- Toto 22M: 10/10 PASS
+
+### Forecast (D+1)
+- Chronos-2 Close: $3,354.85
+- Toto 22M Close: $3,350.46
+- Хоёулаа бууралт (context $3,368.94)
+
+### 80% интервал (Close)
+| Day | Chronos-2 | Toto 22M |
+|-----|-----------|----------|
+| D+1 | [3287..3422] | [3281..3404] |
+| D+10 | [3206..3456] | [3219..3423] |
+
+### Гол дүгнэлт
+- **0.30-0.52% зөрүү** — гайхалтай нийцэл
+- Хоёулаа бууралт таамаглаж байна (1.2-1.3%)
+- Toto интервал 10-20% нарийссан
+- Volume 20% зөрүү (хэвийн, дуу чимээтэй)
