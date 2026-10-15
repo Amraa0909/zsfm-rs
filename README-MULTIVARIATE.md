@@ -202,3 +202,43 @@ Chronos формат: 5 variate = [Open, High, Low, Close, Volume]
 - Structural breaks (jumps) - mean reversion гэж үздэг
 - Random walk - coverage 0%
 - Volume - 20-30% MAE (OHLC-ээс илүү дуу чимээтэй)
+
+
+## 📊 Backtest: BTCUSDT (150 rolling windows)
+
+### Арга
+- Binance-ээс 200 өдрийн BTCUSDT (daily)
+- 32 өдрийн context → 8 өдрийн forecast
+- 1 өдрөөр шилжиж, 150 window
+- Univariate (Close)
+
+### Үр дүн: Chronos-2 vs Toto 2.0 22M
+
+| Metric | Chronos-2 (120M) | Toto 22M | Ялгаа |
+|--------|------------------|----------|-------|
+| Average MAE | ,866.97 | **,646.84** | -7.7% |
+| Average RMSE | ,279.89 | **,013.66** | -8.1% |
+| Median MAE | ,779 | **,698** | -4.5% |
+| Direction | 49.7% | 49.3% | ~0 |
+| Coverage | 75.5% | **77.2%** | +1.7% |
+| q0.10 breach | 10.8% | **10.0%** | Төгс |
+| q0.90 breach | 13.7% | **12.8%** | Сайжсан |
+| Хугацаа (150 win) | 56.1s | **5.2s** | 12× хурдан |
+| Файл | 127 MB | **35 MB** | 3.6× жижиг |
+
+### Гол дүгнэлт
+- **Toto 22M нь 5.5× бага параметртэй ч илүү нарийвчлалтай**
+- **Direction ~50%** — BTC-ийн чиглэл санамсаргүй (efficient market)
+- **Quantile calibration** — Toto илүү сайн (10.0% vs 10.8%)
+- **Pareto improvement** — Toto бүх хэмжүүрээр илүү сайн
+
+### Хоёулаа ижил сул талтай
+- Direction ~50% (таамаглах боломжгүй)
+- Worst windows W109-W111 (0k-2k MAE)
+- Coverage >90% (underconfident) ~51%
+
+### Хэрэглээ
+- ✅ **Probabilistic forecast** (quantile интервал)
+- ✅ **Risk management** (VaR)
+- ✅ **Volatility estimation**
+- ❌ **Directional trading** (long/short signal)
