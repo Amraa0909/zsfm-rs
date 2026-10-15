@@ -157,3 +157,48 @@ Chronos формат: 5 variate = [Open, High, Low, Close, Volume]
 - api.binance.com
 - api1.binance.com
 - api2.binance.com
+
+
+## 🧪 Synthetic Pattern Benchmark (10 patterns)
+
+### Тестийн дизайн
+- 10 өөр зах зээлийн хэв маяг (32 context + 8 forecast)
+- Univariate: 1 variate (Close)
+- Multivariate: 5 variate (O, H, L, C, V) OHLCV
+
+### Univariate үр дүн
+| Pattern | MAE | Grade |
+|---------|-----|-------|
+| sine_wave | 0.041 | A |
+| trend_up | 0.114 | A |
+| garch | 0.172 | A |
+| flat | 0.185 | A |
+| trend_down | 0.191 | A |
+| exp_growth | 0.270 | A |
+| mean_revert | 0.297 | A |
+| regime_switch | 0.494 | A |
+| random_walk | 2.017 | D |
+| jumps | 5.110 | F |
+
+### Multivariate үр дүн (Close variate)
+| Pattern | Uni MAE | MV MAE | Сайжрал |
+|---------|---------|--------|---------|
+| trend_up | 0.114 | 0.083 | 27% |
+| trend_down | 0.191 | 0.114 | 40% |
+| sine_wave | 0.041 | 0.031 | 24% |
+| mean_revert | 0.297 | 0.185 | 38% |
+| garch | 0.172 | 0.122 | 29% |
+| flat | 0.185 | 0.085 | 54% |
+| exp_growth | 0.270 | 0.140 | 48% |
+| regime_switch | 0.494 | 0.108 | 78% |
+
+### Гол дүгнэлт
+- OHLCV логик: 10/10 PASS (multivariate)
+- Multivariate нь univariate-ээс 24-78% илүү нарийвчлалтай
+- Cross-variate attention бүрэн ажиллаж байна
+- Random walk, jumps нь таамаглах боломжгүй (хэвийн)
+
+### Chronos-2-ын хязгаарлалтууд
+- Structural breaks (jumps) - mean reversion гэж үздэг
+- Random walk - coverage 0%
+- Volume - 20-30% MAE (OHLC-ээс илүү дуу чимээтэй)
