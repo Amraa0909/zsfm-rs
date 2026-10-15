@@ -1,4 +1,0 @@
-Traceback (most recent call last):
-  File "/data/data/com.termux/files/home/zsfm-rs/probability.py", line 10, in <module>
-    from scipy import stats
-ModuleNotFoundError: No module named 'scipy'

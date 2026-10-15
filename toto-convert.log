@@ -1,3 +1,0 @@
-Using cached F32 GGUF at models/Datadog__Toto-2.0-22m/model-f32.gguf …
-note: 18 tensor(s) fell back to F32 (too small for Q8_0 blocks)
-Wrote gguf/toto-22m-q8.gguf
