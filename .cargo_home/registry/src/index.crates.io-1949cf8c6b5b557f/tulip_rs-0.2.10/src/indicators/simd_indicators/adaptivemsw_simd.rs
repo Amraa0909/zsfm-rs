@@ -1,0 +1,101 @@
+pub use crate::indicator_types::{TSimdState, TState};
+use crate::indicators::adaptivemsw::IndicatorState as State;
+use crate::indicators::msw;
+#[cfg(feature = "simd_assets")]
+pub(crate) use crate::indicators::simd_indicators::by_asset::adaptivemsw::indicator_by_assets;
+use crate::indicators::simd_indicators::homodynediscriminator_simd::SimdState as HdSimdState;
+use crate::ring_buffer::fixed_single_buffer::FixedMirrorBuffer;
+use std::simd::Simd;
+use crate::types::Warm;
+/// SIMD-parallel state for the Adaptive MESA Sine Wave across `N` assets simultaneously.
+///
+/// The Homodyne Discriminator pipeline runs fully in SIMD across all `N` lanes,
+/// producing `N` `SmoothPeriod` values per bar. The DFT step runs per-asset
+/// (each asset may have a different adaptive period), but each DFT call uses
+/// the existing 8-wide SIMD `calc_rp_ip` internally.
+///
+/// The price history is stored as `N` independent 50-slot ring buffers (one per
+/// asset) rather than a SIMD ring buffer, because the DFT window length varies
+/// per asset and the DFT itself is not easy to vectorize across lanes with
+/// different window sizes.
+pub struct SimdState<const N: usize> {
+    /// Embedded Homodyne Discriminator SIMD state — all N lanes computed together.
+    pub hd: HdSimdState<N>,
+    /// Per-asset price history buffers for the DFT: `view[0]` = oldest, `view[count-1]` = newest.
+    /// `get_slice_by_period` returns a contiguous oldest-first slice with zero copying.
+    price_bufs: [FixedMirrorBuffer<f64, 50>; N],
+}
+
+impl<const N: usize> SimdState<N> {
+    /// Gathers `N` scalar [`State`] references into a single [`SimdState`].
+    pub fn new(states: &mut [&mut State]) -> Self {
+        // First pass: clone price_bufs (owned data, no lasting borrow).
+        let price_bufs: [FixedMirrorBuffer<f64, 50>; N] =
+            std::array::from_fn(|j| states[j].price_buf.clone());
+
+        // Second pass: collect mutable HD references.
+        let mut hd_refs: Vec<&mut crate::indicators::homodynediscriminator::State<Warm>> =
+            Vec::with_capacity(N);
+        for state in states.iter_mut() {
+            hd_refs.push(&mut state.hd);
+        }
+
+        let hd = HdSimdState::from_states(&mut hd_refs);
+
+        Self { hd, price_bufs }
+    }
+
+    /// Scatters the SIMD state back into `N` scalar [`State`] references.
+    pub fn write_states(&self, states: &mut [&mut State]) {
+        let mut hd_refs: Vec<&mut crate::indicators::homodynediscriminator::State<Warm>> =
+            Vec::with_capacity(N);
+        for (j, state) in states.iter_mut().enumerate() {
+            hd_refs.push(&mut state.hd);
+            state.price_buf = self.price_bufs[j].clone();
+        }
+        TSimdState::write_states(&self.hd, &mut hd_refs);
+    }
+
+}
+
+impl<const N: usize> TSimdState for SimdState<N> {
+    type ScalarState = State;
+    fn from_states(states: &mut [&mut State]) -> Self {
+        Self::new(states)
+    }
+    fn write_states(&self, states: &mut [&mut State]) {
+        SimdState::write_states(self, states);
+    }
+}
+
+impl<const N: usize> TState for SimdState<N> {
+    type Inputs<'a> = Simd<f64, N>;
+    type Outputs = (Simd<f64, N>, Simd<f64, N>); // (sine, lead_sine)
+
+    fn calc<'a>(&mut self, real: Simd<f64, N>) -> (Simd<f64, N>, Simd<f64, N>) {
+        // Run HD for all N lanes simultaneously.
+        let dc = self.hd.calc(real);
+        let dc_arr = dc.to_array();
+        let real_arr = real.to_array();
+
+        let mut sine_arr = [0.0_f64; N];
+        let mut lead_arr = [0.0_f64; N];
+
+        // Per-lane DFT: each uses its own adaptive period and price history.
+        for j in 0..N {
+            self.price_bufs[j].push(real_arr[j]);
+            let period = ((dc_arr[j] + 0.5) as usize).clamp(6, self.price_bufs[j].len().min(50));
+            let (cos_tw, sin_tw) = msw::twiddles_for_period(period);
+            let (rp, ip) = msw::dot_product_simd::<8>(
+                self.price_bufs[j].get_slice_by_period(period),
+                cos_tw,
+                sin_tw,
+            );
+            let (sine, lead) = msw::phase_from_rp_ip(rp, ip);
+            sine_arr[j] = sine;
+            lead_arr[j] = lead;
+        }
+
+        (Simd::from_array(sine_arr), Simd::from_array(lead_arr))
+    }
+}

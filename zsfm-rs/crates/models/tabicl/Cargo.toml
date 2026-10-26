@@ -7,13 +7,13 @@ repository.workspace = true
 description = "TabICL (jingang/TabICL, v2) zero-shot tabular foundation model: GGUF conversion + Burn in-context-learning inference (classification only; regression's quantile-distribution head and >10-class mixed-radix ensembling are out of scope)."
 
 [dependencies]
+burn.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 safetensors.workspace = true
 byteorder.workspace = true
 indicatif.workspace = true
-burn.workspace = true
 zsfm-core.workspace = true
 zsfm-gguf.workspace = true
 zsfm-hub.workspace = true

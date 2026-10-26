@@ -1,0 +1,6 @@
+/target
+/.vscode/
+/proptest-regressions/
+/choosealicense.com
+__pycache__/
+.*_cache/

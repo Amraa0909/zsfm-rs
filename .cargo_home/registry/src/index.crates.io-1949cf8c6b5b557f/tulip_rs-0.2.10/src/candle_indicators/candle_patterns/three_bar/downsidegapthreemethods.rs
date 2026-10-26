@@ -1,0 +1,78 @@
+use crate::candle_indicators::registry::CandleBits;
+use crate::candle_indicators::{
+    common::cdl_real_within_body,
+    pattern_test::EmaState,
+    types::{CandleInfo, ForecastType},
+};
+use tulip_rs_macros::pattern_template;
+
+use super::{FIRST, THIRD};
+
+pub fn info() -> CandleInfo {
+    CandleInfo {
+        name: "downsidegapthreemethods",
+        full_name: "Downside Gap Three Methods",
+        forecast: ForecastType::BearishContinuation,
+        bars: 3,
+        extended_pattern: None,
+        japanese_name: "Kyoku no santen boshi",
+    }
+}
+/// Advanced pattern calculation with additional constraints
+///
+/// This performs checks beyond the basic pattern matching:
+/// - Each bar opens within the previous bar's body
+/// - Bodies get progressively smaller
+/// - Upper shadows get progressively longer
+///
+/// The registry handles basic filtering (trend, bar count, colours, fills).
+/// This function handles the complex relational checks between bars.
+///
+/// # Arguments
+/// * `open` - Open prices array
+/// * `high` - High prices array
+/// * `low` - Low prices array
+/// * `close` - Close prices array
+/// * `i` - Current index in the arrays
+/// * `_state` - EMA state for volatility calculations (unused here)
+///
+/// # Returns
+/// `true` if all advanced conditions are met, `false` otherwise
+#[pattern_template(
+    name = "DownsideGapThreemethods",
+    forecast = "BearishContinuation",
+    prev_bar(trend = "DOWN"),
+    bar(
+        colour = "RED",
+        fill = "FILL",
+        line_height = "LONG",
+        body_height = "LONG",
+        candle_type = "Basic(BlackCandle | LongBlackCandle) Marubozu(OpeningBlackMarubozu | ClosingBlackMarubozu | BlackMarubozu)"
+    ),
+    bar(
+        colour = "RED",
+        fill = "FILL",
+        wick_gap = "GAP_DOWN",
+        line_height = "LONG",
+        body_height = "LONG",
+        candle_type = "Basic(BlackCandle | LongBlackCandle) Marubozu(OpeningBlackMarubozu | ClosingBlackMarubozu | BlackMarubozu)"
+    ),
+    bar(
+        colour = "GREEN",
+        fill = "HALLOW",
+        open_in_prev_body = "TRUE",
+        close_in_prev_body = "FALSE",
+        close_above_prev_mid = "TRUE",
+        candle_type = "Basic(WhiteCandle | ShortWhiteCandle | LongWhiteCandle) Marubozu(OpeningWhiteMarubozu | ClosingWhiteMarubozu | WhiteMarubozu)"
+    )
+)]
+
+pub fn calc(
+    inputs: (&[f64], &[f64], &[f64], &[f64]),
+    _state: &EmaState,
+    _bars: &[CandleBits],
+) -> bool {
+    let (open, _, _, close) = inputs;
+
+    cdl_real_within_body((open[FIRST], close[FIRST]), close[THIRD])
+}

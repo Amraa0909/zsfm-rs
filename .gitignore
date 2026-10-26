@@ -47,4 +47,5 @@ hf_openapi.md
 # Model cache (created by `zsfm <model> convert --model-dir`, always at the
 # repo root for default invocations). Anchored so it never matches the
 # `zsfm-rs/crates/models/` source tree.
-/models/
+/models/.cargo_home/
+target/

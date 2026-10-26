@@ -1,0 +1,297 @@
+use crate::common::{validate_inputs, validate_options};
+#[cfg(feature = "simd_options")]
+pub use crate::indicator_types::IndicatorByOptions;
+#[cfg(any(feature = "simd_assets", feature = "simd_options"))]
+pub use crate::indicator_types::SimdIndicatorResult;
+pub use crate::indicator_types::{Indicator, IndicatorResult, TIndicatorState, TState};
+use crate::types::{Cold, DisplayGroup, DisplayType, IndicatorError, IndicatorType, Info, Warm};
+use serde::{Deserialize, Serialize};
+
+/// Number of input price series required by this indicator.
+pub const INPUTS: usize = 1;
+
+/// Number of option parameters required by this indicator.
+pub const OPTIONS: usize = 1;
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct IndicatorState {
+    state: State<Warm>,
+    real: Vec<f64>,
+    f_params: (f64, f64, f64),
+    p_params: (f64, f64),
+    period: usize,
+}
+impl IndicatorState {
+    pub fn new(
+        state: State<Warm>,
+        real: &[f64],
+        period: usize,
+        f_params: (f64, f64, f64),
+        p_params: (f64, f64),
+    ) -> Self {
+        Self {
+            state,
+            f_params,
+            p_params,
+            real: real[real.len() - period + 1..].to_vec(),
+            period,
+        }
+    }
+}
+impl TIndicatorState<1> for IndicatorState {
+    fn batch_indicator(
+        &mut self,
+        inputs: &[&[f64]; INPUTS],
+        optional_outputs: Option<&[bool]>,
+    ) -> Result<Vec<Vec<f64>>, IndicatorError> {
+        validate_inputs(inputs, 1)?;
+
+        self.real.extend_from_slice(inputs[0]);
+
+        let (mut linreg_line, mut slope_line, mut intercept_line);
+        {
+            let capacity = inputs[0].len();
+            (slope_line, intercept_line) = crate::init_optional_outputs_eff!(
+                optional_outputs, &[false, false],
+                slope_line: capacity,
+                intercept_line: capacity
+            );
+            linreg_line = crate::uninit_vec!(f64, capacity);
+        }
+
+        cycle_linreg(
+            &self.real,
+            &mut self.state,
+            (self.f_params, self.p_params),
+            self.period,
+            &mut linreg_line,
+            (&mut slope_line, &mut intercept_line),
+        );
+        self.real.drain(..self.real.len() - self.period + 1);
+
+        Ok(vec![linreg_line, slope_line, intercept_line])
+    }
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct State<S = Cold> {
+    pub sum_y: f64,
+    pub sum_xy: f64,
+    pub n: f64,
+    pub(crate) state: std::marker::PhantomData<S>,
+}
+impl State<Cold> {
+
+    pub fn init_state(data: &[f64], period: usize) -> (State<Warm>, (f64, f64, f64), (f64, f64)) {
+        let (mut sum_x, mut sum_xx, mut sum_y, mut sum_xy) = (0.0, 0.0, 0.0, 0.0);
+        if data.len() >= period - 1 {
+            for i in 0..period - 1 {
+                let d = unsafe { *data.get_unchecked(i) };
+                sum_x += (i + 1) as f64;
+                sum_xx += ((i + 1) as f64).powi(2);
+                sum_y += d;
+                sum_xy += (i + 1) as f64 * d;
+            }
+        }
+        sum_x += period as f64;
+        sum_xx += (period * period) as f64;
+        let per = multiplier(period, sum_x, sum_xx);
+        let n = period as f64;
+        let inv_n = 1.0 / n;
+        let b_scale = period as f64 - sum_x * inv_n;
+        let xy_coef = n * per * b_scale;
+        let y_coef = inv_n - sum_x * per * b_scale;
+        (
+            State {
+                sum_y,
+                sum_xy,
+                n,
+                state: std::marker::PhantomData,
+            },
+            (sum_x, per, inv_n),
+            (xy_coef, y_coef),
+        )
+    }
+}
+impl TState for State<Warm> {
+    type Inputs<'a> = (f64, f64, (f64, f64, f64));
+    type Outputs = (f64, f64, f64);
+    #[inline(always)]
+    fn calc<'a>(
+        &mut self,
+        (prev_value, value, (sum_x, per, inv_n)): Self::Inputs<'a>,
+    ) -> Self::Outputs {
+        self.sum_xy += value * self.n;
+        //self.sum_xy = value.mul_add(self.n, self.sum_xy);
+        self.sum_y += value;
+
+        //let slope = (self.n * self.sum_xy - sum_x * self.sum_y) * per;
+        let slope = self.n.mul_add(self.sum_xy, -(sum_x * self.sum_y)) * per;
+        //let intercept = (self.sum_y - slope * sum_x) * inv_n;
+        let intercept = (-slope).mul_add(sum_x, self.sum_y) * inv_n;
+        //let linreg = intercept + slope * self.n;
+        let linreg = self.n.mul_add(slope, intercept);
+        self.sum_xy -= self.sum_y;
+        self.sum_y -= prev_value;
+
+        (linreg, slope, intercept)
+    }
+}
+impl State<Warm> {
+    #[inline(always)]
+    pub fn partial_calc(
+        &mut self,
+        (prev_value, value, (xy_coef, y_coef)): (f64, f64, (f64, f64)),
+    ) -> f64 {
+        self.sum_xy += value * self.n;
+        self.sum_y += value;
+        //let linreg = self.sum_xy * xy_coef + self.sum_y * y_coef;
+        let linreg = self.sum_xy.mul_add(xy_coef, self.sum_y * y_coef);
+        self.sum_xy -= self.sum_y;
+        self.sum_y -= prev_value;
+        linreg
+    }
+}
+/// Performs the main calculation loop for the LINREG indicator using rolling sums.
+///
+/// # Arguments
+///
+/// * `real` - A slice of input data.
+/// * `state` - A mutable reference to the current `State`.
+/// * `period` - The period for the LINREG calculation.
+/// * `linreg_line` - A mutable slice for storing the LINREG output values.
+/// * `out_vecs` - A tuple of mutable slices for optional slope and intercept outputs.
+fn cycle_linreg(
+    real: &[f64],
+    state: &mut State<Warm>,
+    (f_params, p_params): ((f64, f64, f64), (f64, f64)),
+    period: usize,
+    linreg_line: &mut [f64],
+    out_vecs: (&mut [f64], &mut [f64]),
+) {
+    let (slope_line, intercept_line) = out_vecs;
+    let (has_optional, want_slope, want_intercept) =
+        crate::calc_want_flags!(slope_line, intercept_line);
+
+    if has_optional {
+        for (j, i) in (period - 1..real.len()).enumerate() {
+            let (prev_value, value) = unsafe { (*real.get_unchecked(j), *real.get_unchecked(i)) };
+            let (linreg, slope, intercept) = state.calc((prev_value, value, f_params));
+    
+            unsafe { *linreg_line.get_unchecked_mut(j) = linreg };
+            crate::store_optional_outputs!(j,
+                want_slope, slope_line => slope,
+                want_intercept, intercept_line => intercept
+            );
+        }
+    } else {
+        for (j, i) in (period - 1..real.len()).enumerate() {
+            let (prev_value, value) = unsafe { (*real.get_unchecked(j), *real.get_unchecked(i)) };
+            let linreg = state.partial_calc((prev_value, value, p_params));
+    
+            unsafe { *linreg_line.get_unchecked_mut(j) = linreg };
+        }
+    }
+}
+
+/// Calculates the multiplier for the LINREG calculation.
+#[inline]
+pub fn multiplier(period: usize, sum_x: f64, sum_xx: f64) -> f64 {
+    1.0 / (period as f64 * sum_xx - sum_x.powi(2))
+}
+
+pub struct Linreg;
+
+impl Indicator<INPUTS, OPTIONS> for Linreg {
+    type IndicatorState = IndicatorState;
+
+    const INFO: Info = Info {
+        name: "linreg",
+        indicator_type: IndicatorType::Trend,
+        full_name: "Linear Regression",
+        inputs: &["real"],
+        options: &["period"],
+        outputs: &["linreg"],
+        optional_outputs: &["linregslope", "linregintercept"],
+        display_groups: &[
+            DisplayGroup {
+                offset: None,
+                id: "linreg_linregintercept",
+                label: "Regression",
+                display_type: DisplayType::Overlay,
+                outputs: &["linreg", "linregintercept"],
+            },
+            DisplayGroup {
+                offset: None,
+                id: "linregslope",
+                label: "Linear Regression Slope",
+                display_type: DisplayType::Indicator,
+                outputs: &["linregslope"],
+            },
+        ],
+    };
+
+    fn indicator(
+        inputs: &[&[f64]; INPUTS],
+        options: &[f64; OPTIONS],
+        optional_outputs: Option<&[bool]>,
+    ) -> IndicatorResult<Self::IndicatorState> {
+        validate_options(options)?;
+        let period = options[0] as usize;
+
+        validate_inputs(inputs, Self::min_data(options))?;
+        let real = inputs[0];
+        let (mut linreg_line, mut slope_line, mut intercept_line);
+        {
+            let capacity = Self::output_length(real.len(), options);
+            (slope_line, intercept_line) = crate::init_optional_outputs_eff!(
+                optional_outputs, &[false, false],
+                slope_line: capacity,
+                intercept_line: capacity
+            );
+            linreg_line = crate::uninit_vec!(f64, capacity);
+        }
+        let (mut state, f_params, p_params) = State::init_state(&real[1..period], period);
+        // Perform the main LINREG calculation
+        cycle_linreg(
+            &real[1..],
+            &mut state,
+            (f_params, p_params),
+            period,
+            &mut linreg_line,
+            (&mut slope_line, &mut intercept_line),
+        );
+
+        Ok((
+            vec![linreg_line, slope_line, intercept_line],
+            IndicatorState::new(state, real, period, f_params, p_params),
+        ))
+    }
+
+    #[cfg(feature = "simd_assets")]
+    fn indicator_by_assets<const N: usize>(
+        inputs: &[&[&[f64]; INPUTS]; N],
+        options: &[f64; OPTIONS],
+        optional_outputs: Option<&[bool]>,
+    ) -> SimdIndicatorResult<Vec<Self::IndicatorState>> {
+        crate::indicators::simd_indicators::linreg_simd::indicator_by_assets::<N>(
+            inputs,
+            options,
+            optional_outputs,
+        )
+    }
+}
+
+#[cfg(feature = "simd_options")]
+impl IndicatorByOptions<INPUTS, OPTIONS> for Linreg {
+    fn indicator_by_options<const N: usize>(
+        inputs: &[&[f64]; INPUTS],
+        options: &[&[f64; OPTIONS]; N],
+        optional_outputs: Option<&[bool]>,
+    ) -> SimdIndicatorResult<Vec<Self::IndicatorState>> {
+        crate::indicators::simd_indicators::linreg_simd::indicator_by_options::<N>(
+            inputs,
+            options,
+            optional_outputs,
+        )
+    }
+}

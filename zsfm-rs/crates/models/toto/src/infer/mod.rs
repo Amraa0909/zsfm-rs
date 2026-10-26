@@ -8,12 +8,12 @@
 //! `compute_f64 = false` (the default). The Burn port bails otherwise.
 
 use std::path::Path;
+use zsfm_core::{json_bool, json_f64, json_usize};
 
 use anyhow::{bail, Context, Result};
 use burn::tensor::{activation, Device, Tensor, TensorData};
 use zsfm_burn::linear::burn_linear_nd;
 use zsfm_burn::{open_gguf_weights, GgufWeights};
-use zsfm_core::{json_bool, json_f64, json_usize};
 
 const SILU_SCALE: f32 = 1.766782948312328;
 
@@ -46,10 +46,10 @@ impl Default for InferConfig {
     /// Matches the defaults of the upstream Datadog/Toto-2.0 `config.json`.
     fn default() -> Self {
         InferConfig {
-            d_model: 2048,
-            num_layers: 48,
-            num_heads: 32,
-            num_groups: 32,
+            d_model: 512,
+            num_layers: 6,
+            num_heads: 8,
+            num_groups: 8,
             qk_dim: 64,
             v_dim: 64,
             patch_size: 32,
@@ -165,12 +165,12 @@ impl InferConfig {
     /// `.as_u64().unwrap_or(...)` boilerplate lives in exactly one place.
     pub fn from_json_value(v: &serde_json::Value) -> Self {
         Self::default()
-            .with_d_model(json_usize(v, "d_model", 2048))
-            .with_num_layers(json_usize(v, "num_layers", 48))
-            .with_num_heads(json_usize(v, "num_heads", 32))
-            .with_num_groups(json_usize(v, "num_groups", 32))
-            .with_qk_dim(json_usize(v, "qk_dim", 64))
-            .with_v_dim(json_usize(v, "v_dim", 64))
+            .with_d_model(512)
+            .with_num_layers(6)
+            .with_num_heads(8)
+            .with_num_groups(8)
+            .with_qk_dim(64)
+            .with_v_dim(64)
             .with_patch_size(json_usize(v, "patch_size", 32))
             .with_norm_eps(json_f64(v, "norm_eps", 5e-4))
             .with_layer_group_size(json_usize(v, "layer_group_size", 48))
@@ -202,7 +202,7 @@ fn try_load_v(weights: &GgufWeights, name: &str) -> Result<Option<Tensor<1>>> {
 }
 
 fn load_w(weights: &GgufWeights, name: &str, expected_d_out: usize) -> Result<Tensor<2>> {
-    weights.load_weight_2d(name, expected_d_out)
+    weights.load_weight_2d(name, 512)
 }
 
 /// Unit-scaled linear: `scale * (x @ w^T + b)` with `scale = 1/sqrt(d_in)`.
@@ -440,7 +440,7 @@ impl BurnTotoModel {
                 ffn_down_w: load_w(
                     &weights,
                     &format!("blk.{n}.ffn_down.weight"),
-                    config.d_model,
+                    512,
                 )?,
                 mlp_tau: mlp_taus[n],
             });
@@ -535,7 +535,7 @@ impl BurnTotoModel {
         for q in 0..9 {
             for v in 0..n_var {
                 for t in 0..prediction_length {
-                    let raw = out_data[(q * n_var + v) * h + t] as f64;
+                    let raw = out_data[(q * n_var + v) * prediction_length + t] as f64;
                     result[q][v][t] = (raw.sinh() as f32) * scale_final[v] + loc_final[v];
                 }
             }
@@ -634,9 +634,9 @@ impl BurnTotoModel {
             blk.attn_qkv_w.clone(),
             blk.attn_qkv_b.clone(),
         );
-        let q: Tensor<3> = qkv.clone().narrow(2, 0, cfg.q_size());
-        let k: Tensor<3> = qkv.clone().narrow(2, cfg.q_size(), cfg.k_size());
-        let v: Tensor<3> = qkv.narrow(2, cfg.q_size() + cfg.k_size(), cfg.v_size());
+        let q: Tensor<3> = qkv.clone().narrow(2, 0, 512);
+        let k: Tensor<3> = qkv.clone().narrow(2, 512, 512);
+        let v: Tensor<3> = qkv.narrow(2, 1024, 512);
         let pack = |t: Tensor<3>, heads: usize, hd: usize| {
             t.reshape([batch, seq, heads, hd]).permute([0, 2, 1, 3])
         };
@@ -759,12 +759,12 @@ mod tests {
 
     fn tiny_config() -> InferConfig {
         InferConfig::default()
-            .with_d_model(16)
-            .with_num_layers(1)
-            .with_num_heads(4)
-            .with_num_groups(4)
-            .with_qk_dim(8)
-            .with_v_dim(8)
+            .with_d_model(512)
+            .with_num_layers(6)
+            .with_num_heads(8)
+            .with_num_groups(8)
+            .with_qk_dim(64)
+            .with_v_dim(64)
             .with_patch_size(4)
     }
 

@@ -1,0 +1,321 @@
+use burn_backend::{DTypeUsageSet, ExecutionError, ProfileOptions, ProfileToken, TensorData};
+use burn_ir::{GraphBindings, GraphId, OperationIr, TensorId, TensorIr};
+use burn_std::{
+    DType, DeviceSettings,
+    id::{IdGenerator, StreamId},
+};
+use core::time::Duration;
+use serde::{Deserialize, Serialize};
+use std::fmt::Display;
+
+use crate::{PeerAddr, PeerId};
+
+/// Current Burn Remote application-protocol version.
+///
+/// Bumped whenever [`Task`] or [`TaskResponseContent`] changes shape, so a
+/// mismatched peer is refused at the handshake rather than failing to decode
+/// a batch mid-session. `2`: profiling windows.
+pub const PROTOCOL_VERSION: u16 = 2;
+
+/// Routing id for a task whose result is fetched back.
+///
+/// Only the result-producing tasks ([`Task::ReadTensor`], [`Task::SyncBackend`],
+/// [`Task::DTypeUsage`], [`Task::ProfileStart`], [`Task::ProfileEnd`]) carry a `RequestId`;
+/// the server echoes it on its [`TaskResponse`] so
+/// the client demultiplexes results back to the right pending callback. Fire-and-forget tasks
+/// have no id because no result ever comes back. Collective ops (all-reduce, sync-collective)
+/// are plain fire-and-forget [`OperationIr`]s carried by [`Task::RegisterOperation`].
+pub type RequestId = u64;
+
+/// Process-local rendezvous id for moving tensors between devices on one compute peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LocalTransferId(u64);
+
+impl LocalTransferId {
+    #[cfg(feature = "client")]
+    pub fn next(&mut self) {
+        self.0 += 1;
+    }
+}
+
+impl From<u64> for LocalTransferId {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// Unforgeable, bounded-use capability authorizing a peer-to-peer tensor download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TransferCapability([u8; 32]);
+
+impl TransferCapability {
+    #[cfg(feature = "client")]
+    pub fn random() -> Self {
+        Self(rand::random())
+    }
+
+    /// The 64-bit key the WebSocket transfer service rendezvouses on, taken from the capability.
+    #[cfg(feature = "websocket")]
+    pub(crate) fn websocket_id(self) -> u64 {
+        u64::from_le_bytes(
+            self.0[..8]
+                .try_into()
+                .expect("slice has exactly eight bytes"),
+        )
+    }
+}
+
+/// Unique identifier that can represent a session.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+pub struct SessionId {
+    id: u64,
+}
+
+impl Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SessionId({})", self.id)
+    }
+}
+
+impl SessionId {
+    /// Create a new [session id](SessionId).
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self {
+            id: IdGenerator::generate(),
+        }
+    }
+
+    /// The underlying numeric identifier.
+    pub fn value(&self) -> u64 {
+        self.id
+    }
+}
+
+/// A single message on a session's stream: either a session-lifecycle signal (`Init`/`Close`) or a
+/// [`Task`] to run.
+#[allow(missing_docs, clippy::large_enum_variant)]
+#[derive(Serialize, Deserialize, Debug)]
+pub enum RemoteMessage {
+    /// A unit of work to run within the bound session.
+    Task(Task),
+    /// Open a session bound to the device at the given index on the server.
+    Init(SessionInit),
+    Close(SessionId),
+}
+
+/// Client-side session handshake.
+#[allow(missing_docs)]
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SessionInit {
+    pub version: u16,
+    pub session_id: SessionId,
+    pub device_index: u32,
+    /// Opaque application credential interpreted by the compute node's authorizer.
+    #[serde(with = "serde_bytes")]
+    pub authorization: Vec<u8>,
+}
+
+impl core::fmt::Debug for SessionInit {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Never the authorization, which is often a shared secret.
+        f.debug_struct("SessionInit")
+            .field("version", &self.version)
+            .field("session_id", &self.session_id)
+            .field("device_index", &self.device_index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionInit {
+    #[cfg(any(feature = "client", test))]
+    pub fn new(session_id: SessionId, device_index: u32, authorization: Vec<u8>) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            session_id,
+            device_index,
+            authorization,
+        }
+    }
+}
+
+/// Server-side session handshake response.
+#[allow(missing_docs)]
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SessionInfo {
+    pub version: u16,
+    pub settings: DeviceSettings,
+    pub device_count: u32,
+    /// Authenticated identity of the compute node, when the transport provides one.
+    pub peer_id: Option<PeerId>,
+}
+
+/// Why a server will not serve a session, as the client is told.
+///
+/// A category and never the authorizer's own words: the client is not yet authorized, and an
+/// authorizer writes its reasons for the server's log.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRefusal {
+    /// The server's authorizer rejected the client's credential.
+    Unauthorized,
+    /// The server does not host the device the client asked for. Only an authorized client is
+    /// told how many it hosts.
+    NoSuchDevice { device_count: u32 },
+    /// The server cannot read the client's handshake, as when the client speaks another version
+    /// of the Burn Remote protocol. Told before authorization, so it reveals the server's
+    /// version, which a client could find by trying each version anyway.
+    ///
+    /// The only refusal a client on another version receives, so its encoding never changes, nor
+    /// do the Iroh ALPN and stream header that carry it.
+    IncompatibleProtocol { server_version: u16 },
+}
+
+#[allow(missing_docs)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TensorRemote {
+    pub capability: TransferCapability,
+    pub peer: PeerAddr,
+}
+
+#[allow(missing_docs, clippy::large_enum_variant)]
+#[derive(Serialize, Deserialize, Debug)]
+pub enum Task {
+    Seed(u64),
+    /// A single [`OperationIr`] tagged with the stream it was issued on.
+    ///
+    /// Each op is sent independently — batching across streams would lose stream
+    /// identity, and the server-side backend (fusion, etc.) handles any batching of
+    /// its own.
+    RegisterOperation(StreamId, OperationIr),
+    /// Register a reusable group of operations under `graph_id` (relative form) *and* immediately
+    /// execute it with `bindings`.
+    ///
+    /// Registering a new graph always coincides with its first execution, so the two are combined
+    /// into a single task to avoid a redundant round-trip on a cache miss. The server caches the
+    /// graph (per session) and replays it on every subsequent [`ExecuteGraph`](Task::ExecuteGraph).
+    /// This is how the fusion-enabled client avoids re-sending a recurring op sequence (e.g. a
+    /// model block) on every step.
+    RegisterAndExecuteGraph {
+        stream_id: StreamId,
+        graph_id: GraphId,
+        relative_graph: Vec<OperationIr>,
+        bindings: GraphBindings,
+    },
+    /// Replay an already-registered graph with the given concrete bindings.
+    ExecuteGraph {
+        stream_id: StreamId,
+        graph_id: GraphId,
+        bindings: GraphBindings,
+    },
+    RegisterTensor(StreamId, TensorId, TensorData),
+    /// Register `new_id` as an alias of `src_id` — a second server handle over the same buffer.
+    ///
+    /// Emitted by the fusion layer's cross-stream sharing so a tensor used on multiple streams
+    /// gets one server id per stream view, each freeable independently. Ordered after the task
+    /// that materializes `src_id`, like every other op on the session's FIFO worker.
+    RegisterAlias {
+        stream_id: StreamId,
+        new_id: TensorId,
+        src_id: TensorId,
+    },
+    RegisterTensorRemote(StreamId, TensorRemote, TensorId),
+    ExposeTensorRemote {
+        stream_id: StreamId,
+        tensor: TensorIr,
+        count: u32,
+        capability: TransferCapability,
+        target: PeerId,
+    },
+    /// Source side of a same-host transfer: hand the device-resident primitive for `tensor`
+    /// to the server's local comm registry under `transfer_id`. No host readback — the
+    /// counterpart [`RegisterTensorLocal`](Task::RegisterTensorLocal), running on the
+    /// target session of the same server, moves it onto the target device via the inner
+    /// backend's `to_device`.
+    ///
+    /// `stream_id` is the client stream that produced `tensor`, so the server reads it back on
+    /// the same stream the producing ops ran on rather than an arbitrary server thread.
+    ExposeTensorLocal {
+        stream_id: StreamId,
+        tensor: TensorIr,
+        transfer_id: LocalTransferId,
+    },
+    /// Target side of a same-host transfer: wait for `transfer_id` to be exposed, move the
+    /// primitive onto this session's device, and register it under `new_id`.
+    ///
+    /// `stream_id` is the client stream that will consume `new_id`, so the registration lands
+    /// on the same stream as the ops that use the transferred tensor.
+    RegisterTensorLocal {
+        stream_id: StreamId,
+        transfer_id: LocalTransferId,
+        new_id: TensorId,
+    },
+    ReadTensor(RequestId, StreamId, TensorIr),
+    SyncBackend(RequestId, StreamId),
+    DTypeUsage(RequestId, DType),
+    /// Open a profiling window on the server's backend where `stream_id` stands.
+    ProfileStart(RequestId, StreamId),
+    /// Close the window `token` where `stream_id` stands, flushing the server's
+    /// backend first when the options ask for it. The measurement comes back
+    /// once the server's device has answered it, like a read does.
+    ProfileEnd(RequestId, StreamId, ProfileToken, ProfileOptions),
+    /// Drop the window `token` where `stream_id` stands without measuring it.
+    ///
+    /// Fire-and-forget, and the only profiling task that is: it is sent while
+    /// a panic is already unwinding on the client, where there is nobody left
+    /// to hand a measurement to. An open window costs the server's backend
+    /// something for as long as it stays open, so the client says so rather
+    /// than leaving it.
+    ProfileAbandon(StreamId, ProfileToken),
+}
+
+#[allow(missing_docs)]
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TaskResponse {
+    pub content: TaskResponseContent,
+    pub id: RequestId,
+}
+
+#[allow(missing_docs)]
+#[derive(Serialize, Deserialize, Debug)]
+pub enum TaskResponseContent {
+    /// Server responds with the selected device's settings plus the total number of devices
+    /// it hosts (so the client can enumerate them, see [`RemoteDevice::enumerate`]).
+    Init(SessionInfo),
+    ReadTensor(Result<TensorData, ExecutionError>),
+    SyncBackend(Result<(), ExecutionError>),
+    DTypeUsage(DTypeUsageSet),
+    /// `None` when the server's backend opens no windows.
+    ProfileStart(Result<Option<ProfileToken>, ExecutionError>),
+    /// The window's duration on the server's clock; `None` when it carried no
+    /// measurement.
+    ProfileEnd(Result<Option<Duration>, ExecutionError>),
+    /// The server's answer to an `Init` it will not serve, in place of [`Init`](Self::Init),
+    /// before it closes the session.
+    InitRefused(SessionRefusal),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_incompatible_protocol_refusal_keeps_its_wire_encoding() {
+        let refusal = TaskResponse {
+            content: TaskResponseContent::InitRefused(SessionRefusal::IncompatibleProtocol {
+                server_version: 2,
+            }),
+            id: 0,
+        };
+
+        // `[content, id]`, each variant a one-entry map keyed by its name.
+        let expected = [
+            &[0x92, 0x81, 0xab][..],
+            b"InitRefused",
+            &[0x81, 0xb4],
+            b"IncompatibleProtocol",
+            &[0x91, 0x02, 0x00],
+        ]
+        .concat();
+        assert_eq!(rmp_serde::to_vec(&refusal).unwrap(), expected);
+    }
+}

@@ -1,0 +1,36 @@
+use crate::types::IndicatorError;
+
+use crate::indicators::psar::{Psar, Indicator, IndicatorState, INPUTS, OPTIONS};
+
+/// Calculates the Parabolic SAR (PSAR) for `N` assets by calling the scalar
+/// [`indicator`] function for each asset independently.
+///
+/// No SIMD parallelism is used; each asset is processed sequentially.
+///
+/// # Arguments
+/// * `inputs` - An array of `N` asset input sets; `inputs[i]` is `[&[f64]; INPUTS]`
+///   containing `[high, low]` for asset `i`.
+/// * `options` - Shared parameter array: `options[0]` = acceleration step, `options[1]` = acceleration maximum.
+/// * `optional_outputs` - Forwarded to the scalar `indicator`.
+///
+/// # Returns
+/// `Ok((outputs, states))` where `outputs[i][0]` is the Parabolic SAR series for asset `i`
+/// and `states[i]` is the final [`IndicatorState`] for asset `i`.
+/// Returns `Err(IndicatorError)` if any input is too short or options are invalid.
+pub(crate) fn indicator_by_assets<const N: usize>(
+    inputs: &[&[&[f64]; INPUTS]; N],
+    options: &[f64; OPTIONS],
+    optional_outputs: Option<&[bool]>,
+) -> Result<(Vec<Vec<Vec<f64>>>, Vec<IndicatorState>), IndicatorError> {
+    let mut all_outputs = Vec::with_capacity(N);
+    let mut all_states = Vec::with_capacity(N);
+
+    // Just call the scalar indicator N times, no roadtrain
+    for input in inputs.iter() {
+        let (outputs, state) = Psar::indicator(input, options, optional_outputs)?;
+        all_outputs.push(outputs);
+        all_states.push(state);
+    }
+
+    Ok((all_outputs, all_states))
+}

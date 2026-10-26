@@ -7,13 +7,13 @@ repository.workspace = true
 description = "Toto-2 (Datadog) zero-shot time-series forecaster: GGUF conversion + Burn inference."
 
 [dependencies]
+burn.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 safetensors.workspace = true
 byteorder.workspace = true
 indicatif.workspace = true
-burn.workspace = true
 zsfm-core.workspace = true
 zsfm-gguf.workspace = true
 zsfm-hub.workspace = true
