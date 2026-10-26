@@ -1,5 +1,0 @@
-error: cannot derive `H5Type` for empty structs
- --> tests/compile-fail/empty-struct.rs:6:8
-  |
-6 | struct Foo {}
-  |        ^^^

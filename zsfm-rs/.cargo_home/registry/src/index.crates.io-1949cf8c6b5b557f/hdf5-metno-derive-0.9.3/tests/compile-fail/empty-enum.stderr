@@ -1,5 +1,0 @@
-error: cannot derive `H5Type` for empty enums
- --> tests/compile-fail/empty-enum.rs:6:6
-  |
-6 | enum Foo {}
-  |      ^^^

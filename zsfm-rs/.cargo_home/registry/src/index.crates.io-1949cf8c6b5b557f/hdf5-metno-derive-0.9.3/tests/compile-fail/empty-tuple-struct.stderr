@@ -1,5 +1,0 @@
-error: cannot derive `H5Type` for empty tuple structs
- --> tests/compile-fail/empty-tuple-struct.rs:6:8
-  |
-6 | struct Foo();
-  |        ^^^

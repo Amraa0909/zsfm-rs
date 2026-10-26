@@ -1,5 +1,0 @@
-error: `H5Type` can only be derived for enums with scalar discriminants
- --> tests/compile-fail/enum-non-scalar.rs:6:6
-  |
-6 | enum Foo {
-  |      ^^^

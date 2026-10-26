@@ -1,5 +1,0 @@
-error: `H5Type` requires repr(C), repr(packed) or repr(transparent) for structs
- --> tests/compile-fail/struct-no-repr.rs:6:8
-  |
-6 | struct Foo {
-  |        ^^^

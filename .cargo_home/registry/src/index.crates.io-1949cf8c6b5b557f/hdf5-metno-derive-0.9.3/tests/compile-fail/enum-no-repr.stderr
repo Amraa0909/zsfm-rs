@@ -1,5 +1,0 @@
-error: `H5Type` can only be derived for enums with explicit representation
- --> tests/compile-fail/enum-no-repr.rs:6:6
-  |
-6 | enum Foo {
-  |      ^^^

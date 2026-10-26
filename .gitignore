@@ -49,3 +49,6 @@ hf_openapi.md
 # `zsfm-rs/crates/models/` source tree.
 /models/.cargo_home/
 target/
+zsfm-rs/.cargo_home/
+zsfm-rs/target/
+.cargo_home/

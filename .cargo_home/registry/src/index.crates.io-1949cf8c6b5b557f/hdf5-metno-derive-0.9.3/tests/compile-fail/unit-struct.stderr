@@ -1,5 +1,0 @@
-error: cannot derive `H5Type` for unit structs
- --> tests/compile-fail/unit-struct.rs:6:8
-  |
-6 | struct Foo;
-  |        ^^^
